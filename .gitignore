@@ -1,0 +1,19 @@
+# виртуальное окружение
+venv/
+.env
+.env.*
+*.env
+
+# __pycache__
+__pycache__/
+*.pyc
+
+# IDE stuff
+.idea/
+.vscode/
+*.code-workspace
+
+# sqlite, если вдруг будешь тестить локально на SQLite
+*.db
+*.sqlite
+*.sqlite3
