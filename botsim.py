@@ -547,16 +547,37 @@ async def cancel_expired_pending(s: AsyncSession) -> int:
         logger.info("cancel_expired_pending: отменено %d протухших pending-брони(й)", affected)
     return affected
 
+async def cleanup_expired_pending(session: AsyncSession, now: datetime | None = None):
+    """
+    Переводит протухшие pending-заявки в cancelled:
+    - status = 'pending'
+    - expires_at < now
+    """
+    if now is None:
+        now = datetime.now(TZ)
+
+    await session.execute(
+        text("""
+            UPDATE bookings
+            SET status='cancelled'
+            WHERE status='pending'
+              AND expires_at IS NOT NULL
+              AND expires_at < :now
+        """),
+        {"now": now}
+    )
+    await session.commit()
+
 async def free_sims_for_interval(start_at: datetime, end_at: datetime, exclude_id: Optional[int] = None) -> int:
     start_at, end_at = localize(start_at), localize(end_at)
     async with SessionLocal() as s:
-        # зачистка просроченных pending заявок (общим helper'ом)
-        await cancel_expired_pending(s)
+        # зачистка просроченных pending заявок
+        await cleanup_expired_pending(s)
 
         q = select(func.coalesce(func.sum(Booking.sims), 0)).where(
             Booking.status.in_(("pending", "confirmed", "block")),
             Booking.start_at < end_at,
-            Booking.end_at > start_at,
+            Booking.end_at > start_at
         )
         if exclude_id is not None:
             q = q.where(Booking.id != exclude_id)
@@ -3078,10 +3099,12 @@ async def catch_free_contact(m: Message):
 async def cleanup_pending_worker():
     while True:
         try:
+            now_local = datetime.now(TZ)
             async with SessionLocal() as s:
-                await cancel_expired_pending(s)
-        except Exception as e:
-            logger.exception("cleanup_pending_worker: ошибка при очистке pending: %s", e)
+                await cleanup_expired_pending(s, now_local)
+            logger.info("cleanup_pending_worker: протухшие pending очищены на %s", now_local.isoformat())
+        except Exception:
+            logger.exception("cleanup_pending_worker: ошибка при очистке pending")
         await asyncio.sleep(60)
 
 # ====================== RUN =========================
