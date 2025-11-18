@@ -526,25 +526,38 @@ async def ensure_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+async def cancel_expired_pending(s: AsyncSession) -> int:
+    """
+    Отменяет все просроченные pending-брони (где expires_at < now).
+    Возвращает количество затронутых строк.
+    """
+    result = await s.execute(
+        text("""
+            UPDATE bookings
+            SET status = 'cancelled'
+            WHERE status = 'pending'
+              AND expires_at IS NOT NULL
+              AND expires_at < :now
+        """),
+        {"now": datetime.now(TZ)}
+    )
+    await s.commit()
+    affected = result.rowcount or 0
+    if affected:
+        logger.info("cancel_expired_pending: отменено %d протухших pending-брони(й)", affected)
+    return affected
+
 async def free_sims_for_interval(start_at: datetime, end_at: datetime, exclude_id: Optional[int] = None) -> int:
     start_at, end_at = localize(start_at), localize(end_at)
     async with SessionLocal() as s:
-        # зачистка просроченных pending заявок
-        await s.execute(
-    text("""UPDATE bookings
-            SET status='cancelled'
-            WHERE status='pending'
-              AND expires_at IS NOT NULL
-              AND expires_at < :now"""),
-    {"now": datetime.now(TZ)}
-)
-        await s.commit()
+        # зачистка просроченных pending заявок (общим helper'ом)
+        await cancel_expired_pending(s)
 
         q = select(func.coalesce(func.sum(Booking.sims), 0)).where(
-    Booking.status.in_(("pending", "confirmed", "block")),
-    Booking.start_at < end_at,
-    Booking.end_at > start_at
-)
+            Booking.status.in_(("pending", "confirmed", "block")),
+            Booking.start_at < end_at,
+            Booking.end_at > start_at,
+        )
         if exclude_id is not None:
             q = q.where(Booking.id != exclude_id)
 
@@ -1771,10 +1784,16 @@ async def waitlist_worker():
                 )
                 items = (await s.execute(q)).scalars().all()
 
+            if items:
+                logger.debug("waitlist_worker: активных подписок %d", len(items))
+
             for w in items:
                 free = await free_sims_for_interval(w.start_at, w.end_at)
                 if free >= w.sims_needed:
-                    # Условие выполнено — уведомляем и деактивируем подписку
+                    logger.info(
+                        "waitlist_worker: сработала подписка #%d для user_id=%d (нужно %d, свободно %d)",
+                        w.id, w.user_id, w.sims_needed, free
+                    )
                     try:
                         kb = InlineKeyboardMarkup(
                             inline_keyboard=[[
@@ -1794,17 +1813,16 @@ async def waitlist_worker():
                             ),
                             reply_markup=kb
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception("waitlist_worker: не удалось отправить уведомление user_id=%d: %s", w.user_id, e)
 
                     async with SessionLocal() as s:
                         w_db = await s.get(Waitlist, w.id)
                         if w_db:
                             w_db.active = 0
                             await s.commit()
-        except Exception:
-            # не валим воркер из-за единичной ошибки
-            pass
+        except Exception as e:
+            logger.exception("waitlist_worker: ошибка в цикле: %s", e)
 
         await asyncio.sleep(60)
 
@@ -2472,7 +2490,6 @@ async def complete_worker():
             now_local = datetime.now(TZ)
 
             async with SessionLocal() as s:
-                # найдём все просроченные подтверждённые брони
                 q = (
                     select(Booking)
                     .where(
@@ -2483,13 +2500,14 @@ async def complete_worker():
                 finished = (await s.execute(q)).scalars().all()
 
                 if finished:
+                    logger.info("complete_worker: найдено %d завершившихся confirmed-брони(й)", len(finished))
+
                     for b in finished:
                         b.status = "done"
                         b.expires_at = None  # на всякий случай
                     await s.commit()
-        except Exception:
-            # не падаем из-за случайной ошибки
-            pass
+        except Exception as e:
+            logger.exception("complete_worker: ошибка в цикле: %s", e)
 
         await asyncio.sleep(60)
 
@@ -2512,6 +2530,9 @@ async def reminder_worker():
                 )
                 rows = (await s.execute(q)).scalars().all()
 
+            if rows:
+                logger.info("reminder_worker: отправляем напоминания по %d брони(ям)", len(rows))
+
             for b in rows:
                 try:
                     await bot.send_message(
@@ -2520,111 +2541,102 @@ async def reminder_worker():
                         f"Ваша бронь #{b.id} в {human(b.start_at)} "
                         f"({b.sims} {sims_word(b.sims)}, {b.duration} мин). Ждём вас!"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("reminder_worker: не удалось отправить напоминание по брони #%d: %s", b.id, e)
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("reminder_worker: ошибка в цикле: %s", e)
 
         await asyncio.sleep(60)
 
 async def autoconfirm_worker():
     while True:
-        now_local = datetime.now(TZ)
-        soon_to = now_local + AUTOCONFIRM_BEFORE
+        try:
+            now_local = datetime.now(TZ)
+            soon_to = now_local + AUTOCONFIRM_BEFORE
 
-        async with SessionLocal() as s:
-            q = (
-                select(Booking)
-                .where(
-                    Booking.status == "pending",
-                    Booking.start_at > now_local,
-                    Booking.start_at <= soon_to,
-                )
-            )
-            pendings = (await s.execute(q)).scalars().all()
-
-        for b in pendings:
             async with SessionLocal() as s:
-                b = await s.get(Booking, b.id)
-                if not b:
-                    continue
+                q = (
+                    select(Booking)
+                    .where(
+                        Booking.status == "pending",
+                        Booking.start_at > now_local,
+                        Booking.start_at <= soon_to,
+                    )
+                )
+                pendings = (await s.execute(q)).scalars().all()
 
-                if b.status != "pending":
-                    continue
+            if pendings:
+                logger.debug("autoconfirm_worker: найдено %d pending-заявок в окне автоподтверждения", len(pendings))
 
-                if b.expires_at and b.expires_at < datetime.now(TZ):
-                    continue
+            for b in pendings:
+                async with SessionLocal() as s:
+                    b = await s.get(Booking, b.id)
+                    if not b:
+                        continue
 
-                free = await free_sims_for_interval(b.start_at, b.end_at, exclude_id=b.id)
-                if free < b.sims:
-                    continue
+                    if b.status != "pending":
+                        continue
 
-                b.status = "confirmed"
-                b.expires_at = None
-                await s.commit()
-                await s.refresh(b)
+                    if b.expires_at and b.expires_at < datetime.now(TZ):
+                        logger.info("autoconfirm_worker: бронь #%d протухла по expires_at", b.id)
+                        continue
 
-                b_user_id = b.user_id
-                b_id = b.id
-                b_start = b.start_at
-                b_end = b.end_at
-                b_sims = b.sims
-                b_dur = b.duration
-                b_price = b.price
-                b_name = b.client_name or "-"
-                b_phone = b.client_phone or "-"
-
-            # 👇 Клавиатура для пользователя при автоподтверждении
-            kb_user = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="📅 В календарь (.ics)",
-                            callback_data=f"ics:send:{b_id}"
+                    free = await free_sims_for_interval(b.start_at, b.end_at, exclude_id=b.id)
+                    if free < b.sims:
+                        logger.info(
+                            "autoconfirm_worker: бронь #%d не автоподтверждена, не хватает симов (нужно %d, свободно %d)",
+                            b.id, b.sims, free
                         )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="📄 Мои заявки",
-                            callback_data="my:list"
-                        )
-                    ]
-                ]
-            )
+                        continue
 
-            try:
-                await bot.send_message(
-                    b_user_id,
-                    (
-                        f"✅ Ваша бронь #{b_id} подтверждена автоматически!\n"
-                        f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
-                        f"{b_sims} {sims_word(b_sims)} | {b_dur} мин\n"
-                        f"Оплата на месте: <b>{b_price} ₽</b>\n"
-                        f"Контакт у нас есть: {b_name}, {b_phone}\n\n"
-                        f"📍 Адрес: {ADDRESS_FULL} ({ADDRESS_AREA})\n"
-                        f"Ждём вас 👌"
-                    ),
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(text="🗺 Открыть карту", url=ADDRESS_MAP_URL)]]
-    ),
-)
-            except Exception:
-                pass
-            
+                    b.status = "confirmed"
+                    b.expires_at = None
+                    await s.commit()
+                    await s.refresh(b)
 
-            note_for_admins = (
-                f"🤖 Автоподтверждение заявки #{b_id}\n"
-                f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
-                f"{b_sims} {sims_word(b_sims)} | {b_dur} мин | {b_price} ₽\n"
-                f"Имя: {b_name}\n"
-                f"Тел: {b_phone}"
-            )
-            for admin_id in ADMINS:
+                    b_user_id = b.user_id
+                    b_id = b.id
+                    b_start = b.start_at
+                    b_end = b.end_at
+                    b_sims = b.sims
+                    b_dur = b.duration
+                    b_price = b.price
+                    b_name = b.client_name or "-"
+                    b_phone = b.client_phone or "-"
+
+                logger.info("autoconfirm_worker: автоподтверждена бронь #%d для user_id=%d", b_id, b_user_id)
+
                 try:
-                    await bot.send_message(admin_id, note_for_admins)
-                except Exception:
-                    pass
+                    await bot.send_message(
+                        b_user_id,
+                        (
+                            f"✅ Ваша бронь #{b_id} подтверждена автоматически!\n"
+                            f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
+                            f"{b_sims} {sims_word(b_sims)} | {b_dur} мин\n"
+                            f"Оплата на месте: <b>{b_price} ₽</b>\n"
+                            f"Контакт у нас есть: {b_name}, {b_phone}\n\n"
+                            f"Ждём вас 👌"
+                        )
+                    )
+                except Exception as e:
+                    logger.exception("autoconfirm_worker: не удалось отправить клиенту уведомление по брони #%d: %s", b_id, e)
+
+                note_for_admins = (
+                    f"🤖 Автоподтверждение заявки #{b_id}\n"
+                    f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
+                    f"{b_sims} {sims_word(b_sims)} | {b_dur} мин | {b_price} ₽\n"
+                    f"Имя: {b_name}\n"
+                    f"Тел: {b_phone}"
+                )
+                for admin_id in ADMINS:
+                    try:
+                        await bot.send_message(admin_id, note_for_admins)
+                    except Exception as e:
+                        logger.exception("autoconfirm_worker: не удалось отправить уведомление админу %d: %s", admin_id, e)
+
+        except Exception as e:
+            logger.exception("autoconfirm_worker: ошибка в основном цикле: %s", e)
 
         await asyncio.sleep(60)
 
@@ -2777,16 +2789,8 @@ async def day_cmd(m: Message):
     day_end   = datetime.combine(target, time(23,59,59,tzinfo=TZ))
 
     async with SessionLocal() as s:
-        # подчистим протухшие pending
-        await s.execute(
-    text("""UPDATE bookings
-            SET status='cancelled'
-            WHERE status='pending'
-              AND expires_at IS NOT NULL
-              AND expires_at < :now"""),
-    {"now": datetime.now(TZ)}
-)
-        await s.commit()
+        # подчистим протухшие pending общей функцией
+        await cancel_expired_pending(s)
 
         q = (
             select(Booking)
@@ -3075,17 +3079,9 @@ async def cleanup_pending_worker():
     while True:
         try:
             async with SessionLocal() as s:
-                await s.execute(
-    text("""UPDATE bookings
-            SET status='cancelled'
-            WHERE status='pending'
-              AND expires_at IS NOT NULL
-              AND expires_at < :now"""),
-    {"now": datetime.now(TZ)}
-)
-                await s.commit()
-        except Exception:
-            pass
+                await cancel_expired_pending(s)
+        except Exception as e:
+            logger.exception("cleanup_pending_worker: ошибка при очистке pending: %s", e)
         await asyncio.sleep(60)
 
 # ====================== RUN =========================
