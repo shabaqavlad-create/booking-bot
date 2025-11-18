@@ -125,7 +125,7 @@ class Waitlist(Base):
             "ux_waitlist_unique_active",
             "user_id", "start_at", "end_at", "duration", "sims_needed",
             unique=True,
-            postgresql_where=text("active = true"),
+            postgresql_where=text("active = true"),  # ← ВАЖНО
         ),
         CheckConstraint(f"sims_needed >= 1 AND sims_needed <= {MAX_SIMS}", name="ck_waitlist_sims_range"),
     )
@@ -137,7 +137,7 @@ class Waitlist(Base):
     duration: Mapped[int] = mapped_column(Integer, nullable=False)
     sims_needed: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
 class Booking(Base):
     __tablename__ = "bookings"
     __table_args__ = (
@@ -200,7 +200,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("botsim")
-logging.getLogger("aiogram").setLevel(logging.DEBUG)
+logging.getLogger("aiogram").setLevel(logging.INFO)
 
 
 async def setup_commands():
@@ -526,12 +526,16 @@ async def ensure_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-async def cancel_expired_pending(s: AsyncSession) -> int:
+
+async def cleanup_expired_pending(session: AsyncSession, now: datetime | None = None) -> int:
     """
-    Отменяет все просроченные pending-брони (где expires_at < now).
-    Возвращает количество затронутых строк.
+    Переводит просроченные pending-заявки в cancelled.
+    Возвращает количество изменённых записей.
     """
-    result = await s.execute(
+    if now is None:
+        now = datetime.now(TZ)
+
+    result = await session.execute(
         text("""
             UPDATE bookings
             SET status = 'cancelled'
@@ -539,34 +543,10 @@ async def cancel_expired_pending(s: AsyncSession) -> int:
               AND expires_at IS NOT NULL
               AND expires_at < :now
         """),
-        {"now": datetime.now(TZ)}
-    )
-    await s.commit()
-    affected = result.rowcount or 0
-    if affected:
-        logger.info("cancel_expired_pending: отменено %d протухших pending-брони(й)", affected)
-    return affected
-
-async def cleanup_expired_pending(session: AsyncSession, now: datetime | None = None):
-    """
-    Переводит протухшие pending-заявки в cancelled:
-    - status = 'pending'
-    - expires_at < now
-    """
-    if now is None:
-        now = datetime.now(TZ)
-
-    await session.execute(
-        text("""
-            UPDATE bookings
-            SET status='cancelled'
-            WHERE status='pending'
-              AND expires_at IS NOT NULL
-              AND expires_at < :now
-        """),
         {"now": now}
     )
     await session.commit()
+    return result.rowcount or 0
 
 async def free_sims_for_interval(start_at: datetime, end_at: datetime, exclude_id: Optional[int] = None) -> int:
     start_at, end_at = localize(start_at), localize(end_at)
@@ -1801,7 +1781,7 @@ async def waitlist_worker():
             async with SessionLocal() as s:
                 q = (
                     select(Waitlist)
-                    .where(Waitlist.active == True, Waitlist.start_at > now_local)
+                    .where(Waitlist.active.is_(True), Waitlist.start_at > now_local)
                 )
                 items = (await s.execute(q)).scalars().all()
 
@@ -2810,8 +2790,10 @@ async def day_cmd(m: Message):
     day_end   = datetime.combine(target, time(23,59,59,tzinfo=TZ))
 
     async with SessionLocal() as s:
-        # подчистим протухшие pending общей функцией
-        await cancel_expired_pending(s)
+        # подчистим протухшие pending
+        cleaned = await cleanup_expired_pending(s)
+        if cleaned:
+            logger.info("day_cmd: отменено %d протухших pending-брони(й) перед построением расписания", cleaned)
 
         q = (
             select(Booking)
@@ -3101,8 +3083,13 @@ async def cleanup_pending_worker():
         try:
             now_local = datetime.now(TZ)
             async with SessionLocal() as s:
-                await cleanup_expired_pending(s, now_local)
-            logger.info("cleanup_pending_worker: протухшие pending очищены на %s", now_local.isoformat())
+                cleaned = await cleanup_expired_pending(s, now_local)
+            if cleaned:
+                logger.info(
+                    "cleanup_pending_worker: отменено %d протухших pending-брони(й) на %s",
+                    cleaned, now_local.isoformat()
+                )
+            # если cleaned == 0 — молчим, чтобы не спамить лог
         except Exception:
             logger.exception("cleanup_pending_worker: ошибка при очистке pending")
         await asyncio.sleep(60)
