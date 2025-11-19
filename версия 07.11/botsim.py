@@ -10,6 +10,7 @@ import logging
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+
 import csv
 import tempfile
 
@@ -32,48 +33,134 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
+from dotenv import load_dotenv
 
-
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text
-
-from db import SessionLocal, Booking, Waitlist, ensure_tables
-
-from config import (
-    BOT_TOKEN,
-    ADMINS,
-    TZ,
-    OPEN_T,
-    CLOSE_T,
-    MAX_SIMS,
-    HOLD_MINUTES,
-    PRICES,
-    MAX_ACTIVE_BOOKINGS_PER_USER,
-    SAFETY_GAP,
-    REMIND_BEFORE,
-    AUTOCONFIRM_BEFORE,
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
+)
+from sqlalchemy import (
+    BigInteger,
+    Integer,
+    String,
+    DateTime,
+    select,
+    func,
+    text,
+    Index,
+    CheckConstraint,
+    Boolean,  # ← добавили
 )
 
-from booking_service import free_sims_for_interval, create_pending_booking, cleanup_expired_pending
+# ====================== CONFIG ======================
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан. Добавь его в .env")
 
-from promo_service import PROMO_RULES, apply_promo
+ADMINS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x}
 
-# --- Address & map (Yandex) ---
-ADDRESS_FULL = "Екатеринбург, ул. Академика Парина, 35"
-ADDRESS_AREA = "Академический"
-ADDRESS_MAP_URL = "https://yandex.ru/maps/?text=%D0%95%D0%BA%D0%B0%D1%82%D0%B5%D1%80%D0%B8%D0%BD%D0%B1%D1%83%D1%80%D0%B3%2C%20%D1%83%D0%BB.%20%D0%90%D0%BA%D0%B0%D0%B4%D0%B5%D0%BC%D0%B8%D0%BA%D0%B0%20%D0%9F%D0%B0%D1%80%D0%B8%D0%BD%D0%B0%2C%2035"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не задан. Добавь его в .env")
 
-# Краткая памятка "Как добраться"
-HOWTO_TEXT = (
-    "🚶 Как добраться:\n"
-    f"• Мы находимся в районе {ADDRESS_AREA}, {ADDRESS_FULL}.\n"
-    "• Вход со стороны улицы.\n"
-    "• Парковка вдоль улицы, свободная.\n"
-    "• Если что — звоните: +7 953 046-36-54\n"
-)
+# Екатеринбург (UTC+5)
+# заменяет TZ
+try:
+    TZ = ZoneInfo("Asia/Yekaterinburg")
+except ZoneInfoNotFoundError:
+    try:
+        import tzdata  # noqa: F401
+        TZ = ZoneInfo("Asia/Yekaterinburg")
+    except Exception:
+        logging.warning("tzdata не найден, использую фиксированный UTC+5 без переходов.")
+        TZ = timezone(timedelta(hours=5))
 
+OPEN_H, OPEN_M = 13, 0
+CLOSE_H, CLOSE_M = 23, 0
+OPEN_T = time(OPEN_H, OPEN_M, tzinfo=TZ)
+CLOSE_T = time(CLOSE_H, CLOSE_M, tzinfo=TZ)
+
+MAX_SIMS = 4
+HOLD_MINUTES = 30
+PRICES = {30: 390, 60: 690, 90: 990, 120: 1290}
+MAX_ACTIVE_BOOKINGS_PER_USER = 6  # лимит активных броней
+
+SAFETY_GAP = timedelta(minutes=5)
+
+REMIND_BEFORE = timedelta(hours=2)
+AUTOCONFIRM_BEFORE = timedelta(minutes=45)
 # user_id -> booking_id, который мы ждём контакт
 PENDING_CONTACTS: dict[int, int] = {}
+# ================== DATABASE MODELS =================
+class Base(DeclarativeBase):
+    pass
+
+
+class Waitlist(Base):
+    __tablename__ = "waitlist"
+    __table_args__ = (
+        Index("ix_waitlist_start_end", "start_at", "end_at"),
+        Index("ix_waitlist_active", "active"),
+        Index("ix_waitlist_by_time_active", "active", "start_at", "end_at"),
+        Index(
+            "ux_waitlist_unique_active",
+            "user_id", "start_at", "end_at", "duration", "sims_needed",
+            unique=True,
+            postgresql_where=text("active = true"),
+        ),
+        CheckConstraint(f"sims_needed >= 1 AND sims_needed <= {MAX_SIMS}", name="ck_waitlist_sims_range"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    duration: Mapped[int] = mapped_column(Integer, nullable=False)
+    sims_needed: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+class Booking(Base):
+    __tablename__ = "bookings"
+    __table_args__ = (
+        Index("ix_bookings_start_end", "start_at", "end_at"),
+        Index("ix_bookings_user_active", "user_id", "status", "end_at"),
+        Index("ix_bookings_status_start", "status", "start_at"),
+        Index("ix_bookings_status_end", "status", "end_at"),
+        Index("ix_bookings_status_time", "status", "start_at", "end_at"),
+        Index("ix_bookings_user_active_future", "user_id", "status", "end_at"),  # ← новое
+        CheckConstraint("sims >= 1", name="ck_sims_ge_1"),
+        CheckConstraint("duration IN (30,60,90,120)", name="ck_duration_allowed"),
+        CheckConstraint("end_at > start_at", name="ck_end_gt_start"),
+        CheckConstraint("price >= 0", name="ck_price_ge_0"),
+        CheckConstraint("status IN ('pending','confirmed','cancelled','done','no_show','block')", name="ck_status_enum"),
+)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)  # Telegram user id
+
+    # новое 👇
+    client_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    client_phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sims: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration: Mapped[int] = mapped_column(Integer, nullable=False)  # minutes
+    price: Mapped[int] = mapped_column(Integer, nullable=False)  # rubles
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)   # pending/confirmed/cancelled
+    created_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    server_default=func.now()
+)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+# ================ ENGINE & SESSION ==================
+engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 # ====================== BOT CORE ====================
 SESSION_TIMEOUT = 120  # сек, важно чтобы было число
@@ -98,7 +185,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("botsim")
-logging.getLogger("aiogram").setLevel(logging.INFO)
+logging.getLogger("aiogram").setLevel(logging.DEBUG)
 
 
 async def setup_commands():
@@ -420,6 +507,35 @@ def human(dt: datetime) -> str:
 def price_for(duration: int, sims: int) -> int:
     return PRICES[duration] * sims
 
+async def ensure_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def free_sims_for_interval(start_at: datetime, end_at: datetime, exclude_id: Optional[int] = None) -> int:
+    start_at, end_at = localize(start_at), localize(end_at)
+    async with SessionLocal() as s:
+        # зачистка просроченных pending заявок
+        await s.execute(
+    text("""UPDATE bookings
+            SET status='cancelled'
+            WHERE status='pending'
+              AND expires_at IS NOT NULL
+              AND expires_at < :now"""),
+    {"now": datetime.now(TZ)}
+)
+        await s.commit()
+
+        q = select(func.coalesce(func.sum(Booking.sims), 0)).where(
+    Booking.status.in_(("pending", "confirmed", "block")),
+    Booking.start_at < end_at,
+    Booking.end_at > start_at
+)
+        if exclude_id is not None:
+            q = q.where(Booking.id != exclude_id)
+
+        total_taken = (await s.execute(q)).scalar_one()
+        free = MAX_SIMS - int(total_taken)
+        return max(0, free)
 
 def confirm_user_kb(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -449,11 +565,11 @@ def main_menu_kb():
                 InlineKeyboardButton(text="💳 Тарифы", callback_data="tariffs"),
                 InlineKeyboardButton(text="🕒 Часы работы", callback_data="hours")
             ],
-            [InlineKeyboardButton(text="📍 Адрес", callback_data="address")],  # 👈 добавили
-            [InlineKeyboardButton(text="📚 Помощь", callback_data="help:open")],
+            [InlineKeyboardButton(text="📚 Помощь", callback_data="help:open")],  # <—
             [InlineKeyboardButton(text="📞 Связаться", callback_data="contact")]
         ]
     )
+
 
 
 # ===================== HANDLERS =====================
@@ -754,48 +870,13 @@ async def tariffs_show_total(c: CallbackQuery):
 
 @dp.callback_query(F.data == "contact")
 async def contact_cb(c: CallbackQuery):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🗺 Открыть карту", url=ADDRESS_MAP_URL)],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_home")]
-        ]
-    )
     await safe_edit_text(
         c.message,
         "📞 Связаться с администратором:\n"
         "• Телефон: +7 953 046-36-54\n"
-        "• Telegram: @shaba_V\n\n"
-        f"📍 Адрес: {ADDRESS_FULL} ({ADDRESS_AREA})",
-        reply_markup=kb
-    )
-    await c.answer()
-
-@dp.callback_query(F.data == "address")
-async def address_cb(c: CallbackQuery):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🗺 Открыть карту", url=ADDRESS_MAP_URL)],
-            [InlineKeyboardButton(text="🧭 Как добраться", callback_data="howto")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_home")]
-        ]
-    )
-    await safe_edit_text(
-        c.message,
-        f"📍 {ADDRESS_FULL}\nРайон: {ADDRESS_AREA}\n\n"
-        "Нажми «Открыть карту», чтобы построить маршрут в Яндекс.Картах.",
-        reply_markup=kb
-    )
-    await c.answer()
-
-@dp.callback_query(F.data == "howto")
-async def howto_cb(c: CallbackQuery):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к адресу", callback_data="address")]]
-    )
-    await safe_edit_text(
-        c.message,
-        HOWTO_TEXT,
-        reply_markup=kb
+        "• Telegram: @shaba_V\n"
+        "Адрес: Екатеринбург, Район Академический",
+        reply_markup=main_menu_kb()
     )
     await c.answer()
 
@@ -1245,35 +1326,40 @@ async def book_finalize(m: Message, state: FSMContext):
 
     start = datetime.fromtimestamp(start_ts, tz=TZ)
     end = datetime.fromtimestamp(end_ts, tz=TZ)
-
+    
     # финальная проверка слота на всякий случай
     if await free_sims_for_interval(start, end) < sims:
         await m.answer("😔 Пока ты писал контакт, слот заняли. Попробуй снова /start")
         await state.clear()
         return
 
-    # создаём бронирование через сервисный слой
-    b = await create_pending_booking(
-        user_id=m.from_user.id,
-        client_name=client_name,
-        client_phone=client_phone,
-        start=start,
-        end=end,
-        sims=sims,
-        duration=duration,
-        price=price,
-    )
+    async with SessionLocal() as s:
+        b = Booking(
+            user_id=m.from_user.id,
+            client_name=client_name,
+            client_phone=client_phone,
+            start_at=start,
+            end_at=end,
+            sims=sims,
+            duration=duration,
+            price=price,
+            status="pending",
+            expires_at=datetime.now(TZ) + timedelta(minutes=HOLD_MINUTES),
+        )
+        s.add(b)
+        await s.commit()
+        await s.refresh(b)
     booking_id = b.id
     expires_local = b.expires_at.astimezone(TZ)
 
-    # дальше оставляем твою логику промокодов, уведомлений и т.п. без изменений
+    # учёт промокода (если был в pending)
     applied = PROMOS_PENDING.pop(m.from_user.id, None)
     promo_note = ""
     if applied:
         code = applied["code"]
         rule = applied["rule"]
-        _promo_mark_used(code, m.from_user.id)
-        promo_note = f" (со скидкой по коду {code})"
+        _promo_mark_used(code, m.from_user.id, rule)
+        promo_note = f" (с промокодом {code})"
 
     # Сообщаем юзеру
     await m.answer(
@@ -1631,20 +1717,14 @@ async def waitlist_worker():
             async with SessionLocal() as s:
                 q = (
                     select(Waitlist)
-                    .where(Waitlist.active.is_(True), Waitlist.start_at > now_local)
+                    .where(Waitlist.active == True, Waitlist.start_at > now_local)
                 )
                 items = (await s.execute(q)).scalars().all()
-
-            if items:
-                logger.debug("waitlist_worker: активных подписок %d", len(items))
 
             for w in items:
                 free = await free_sims_for_interval(w.start_at, w.end_at)
                 if free >= w.sims_needed:
-                    logger.info(
-                        "waitlist_worker: сработала подписка #%d для user_id=%d (нужно %d, свободно %d)",
-                        w.id, w.user_id, w.sims_needed, free
-                    )
+                    # Условие выполнено — уведомляем и деактивируем подписку
                     try:
                         kb = InlineKeyboardMarkup(
                             inline_keyboard=[[
@@ -1664,16 +1744,17 @@ async def waitlist_worker():
                             ),
                             reply_markup=kb
                         )
-                    except Exception as e:
-                        logger.exception("waitlist_worker: не удалось отправить уведомление user_id=%d: %s", w.user_id, e)
+                    except Exception:
+                        pass
 
                     async with SessionLocal() as s:
                         w_db = await s.get(Waitlist, w.id)
                         if w_db:
-                            w_db.active = False
+                            w_db.active = 0
                             await s.commit()
-        except Exception as e:
-            logger.exception("waitlist_worker: ошибка в цикле: %s", e)
+        except Exception:
+            # не валим воркер из-за единичной ошибки
+            pass
 
         await asyncio.sleep(60)
 
@@ -1906,8 +1987,7 @@ async def admin_approve(c: CallbackQuery):
                     f"{human(start_at)}–{end_at.astimezone(TZ).strftime('%H:%M')} | "
                     f"{sims} {sims_word(sims)} | {dur} мин\n"
                     f"Оплата на месте: <b>{price} ₽</b>\n"
-                    f"Контакт у нас есть: {client_name}, {client_phone}\n"
-                    f"📍 Адрес: {ADDRESS_FULL} ({ADDRESS_AREA})"
+                    f"Контакт у нас есть: {client_name}, {client_phone}"
                 ),
                 reply_markup=confirm_user_kb(bid)   # ← вот это
             )
@@ -2341,6 +2421,7 @@ async def complete_worker():
             now_local = datetime.now(TZ)
 
             async with SessionLocal() as s:
+                # найдём все просроченные подтверждённые брони
                 q = (
                     select(Booking)
                     .where(
@@ -2351,14 +2432,13 @@ async def complete_worker():
                 finished = (await s.execute(q)).scalars().all()
 
                 if finished:
-                    logger.info("complete_worker: найдено %d завершившихся confirmed-брони(й)", len(finished))
-
                     for b in finished:
                         b.status = "done"
                         b.expires_at = None  # на всякий случай
                     await s.commit()
-        except Exception as e:
-            logger.exception("complete_worker: ошибка в цикле: %s", e)
+        except Exception:
+            # не падаем из-за случайной ошибки
+            pass
 
         await asyncio.sleep(60)
 
@@ -2381,9 +2461,6 @@ async def reminder_worker():
                 )
                 rows = (await s.execute(q)).scalars().all()
 
-            if rows:
-                logger.info("reminder_worker: отправляем напоминания по %d брони(ям)", len(rows))
-
             for b in rows:
                 try:
                     await bot.send_message(
@@ -2392,102 +2469,108 @@ async def reminder_worker():
                         f"Ваша бронь #{b.id} в {human(b.start_at)} "
                         f"({b.sims} {sims_word(b.sims)}, {b.duration} мин). Ждём вас!"
                     )
-                except Exception as e:
-                    logger.exception("reminder_worker: не удалось отправить напоминание по брони #%d: %s", b.id, e)
+                except Exception:
+                    pass
 
-        except Exception as e:
-            logger.exception("reminder_worker: ошибка в цикле: %s", e)
+        except Exception:
+            pass
 
         await asyncio.sleep(60)
 
 async def autoconfirm_worker():
     while True:
-        try:
-            now_local = datetime.now(TZ)
-            soon_to = now_local + AUTOCONFIRM_BEFORE
+        now_local = datetime.now(TZ)
+        soon_to = now_local + AUTOCONFIRM_BEFORE
 
+        async with SessionLocal() as s:
+            q = (
+                select(Booking)
+                .where(
+                    Booking.status == "pending",
+                    Booking.start_at > now_local,
+                    Booking.start_at <= soon_to,
+                )
+            )
+            pendings = (await s.execute(q)).scalars().all()
+
+        for b in pendings:
             async with SessionLocal() as s:
-                q = (
-                    select(Booking)
-                    .where(
-                        Booking.status == "pending",
-                        Booking.start_at > now_local,
-                        Booking.start_at <= soon_to,
-                    )
-                )
-                pendings = (await s.execute(q)).scalars().all()
+                b = await s.get(Booking, b.id)
+                if not b:
+                    continue
 
-            if pendings:
-                logger.debug("autoconfirm_worker: найдено %d pending-заявок в окне автоподтверждения", len(pendings))
+                if b.status != "pending":
+                    continue
 
-            for b in pendings:
-                async with SessionLocal() as s:
-                    b = await s.get(Booking, b.id)
-                    if not b:
-                        continue
+                if b.expires_at and b.expires_at < datetime.now(TZ):
+                    continue
 
-                    if b.status != "pending":
-                        continue
+                free = await free_sims_for_interval(b.start_at, b.end_at, exclude_id=b.id)
+                if free < b.sims:
+                    continue
 
-                    if b.expires_at and b.expires_at < datetime.now(TZ):
-                        logger.info("autoconfirm_worker: бронь #%d протухла по expires_at", b.id)
-                        continue
+                b.status = "confirmed"
+                b.expires_at = None
+                await s.commit()
+                await s.refresh(b)
 
-                    free = await free_sims_for_interval(b.start_at, b.end_at, exclude_id=b.id)
-                    if free < b.sims:
-                        logger.info(
-                            "autoconfirm_worker: бронь #%d не автоподтверждена, не хватает симов (нужно %d, свободно %d)",
-                            b.id, b.sims, free
+                b_user_id = b.user_id
+                b_id = b.id
+                b_start = b.start_at
+                b_end = b.end_at
+                b_sims = b.sims
+                b_dur = b.duration
+                b_price = b.price
+                b_name = b.client_name or "-"
+                b_phone = b.client_phone or "-"
+
+            # 👇 Клавиатура для пользователя при автоподтверждении
+            kb_user = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📅 В календарь (.ics)",
+                            callback_data=f"ics:send:{b_id}"
                         )
-                        continue
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="📄 Мои заявки",
+                            callback_data="my:list"
+                        )
+                    ]
+                ]
+            )
 
-                    b.status = "confirmed"
-                    b.expires_at = None
-                    await s.commit()
-                    await s.refresh(b)
+            try:
+                await bot.send_message(
+                    b_user_id,
+                    (
+                        f"✅ Ваша бронь #{b_id} подтверждена автоматически!\n"
+                        f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
+                        f"{b_sims} {sims_word(b_sims)} | {b_dur} мин\n"
+                        f"Оплата на месте: <b>{b_price} ₽</b>\n"
+                        f"Контакт у нас есть: {b_name}, {b_phone}\n\n"
+                        f"Ждём вас 👌"
+                    ),
+                    autoconfirm_worker  # 👈 добавили
+                )
+            except Exception:
+                pass
+            
 
-                    b_user_id = b.user_id
-                    b_id = b.id
-                    b_start = b.start_at
-                    b_end = b.end_at
-                    b_sims = b.sims
-                    b_dur = b.duration
-                    b_price = b.price
-                    b_name = b.client_name or "-"
-                    b_phone = b.client_phone or "-"
-
-                logger.info("autoconfirm_worker: автоподтверждена бронь #%d для user_id=%d", b_id, b_user_id)
-
+            note_for_admins = (
+                f"🤖 Автоподтверждение заявки #{b_id}\n"
+                f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
+                f"{b_sims} {sims_word(b_sims)} | {b_dur} мин | {b_price} ₽\n"
+                f"Имя: {b_name}\n"
+                f"Тел: {b_phone}"
+            )
+            for admin_id in ADMINS:
                 try:
-                    await bot.send_message(
-                        b_user_id,
-                        (
-                            f"✅ Ваша бронь #{b_id} подтверждена автоматически!\n"
-                            f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
-                            f"{b_sims} {sims_word(b_sims)} | {b_dur} мин\n"
-                            f"Оплата на месте: <b>{b_price} ₽</b>\n"
-                            f"Контакт у нас есть: {b_name}, {b_phone}\n\n"
-                            f"Ждём вас 👌"
-                        )
-                    )
-                except Exception as e:
-                    logger.exception("autoconfirm_worker: не удалось отправить клиенту уведомление по брони #%d: %s", b_id, e)
-
-                note_for_admins = (
-                    f"🤖 Автоподтверждение заявки #{b_id}\n"
-                    f"{human(b_start)}–{b_end.astimezone(TZ).strftime('%H:%M')} | "
-                    f"{b_sims} {sims_word(b_sims)} | {b_dur} мин | {b_price} ₽\n"
-                    f"Имя: {b_name}\n"
-                    f"Тел: {b_phone}"
-                )
-                for admin_id in ADMINS:
-                    try:
-                        await bot.send_message(admin_id, note_for_admins)
-                    except Exception as e:
-                        logger.exception("autoconfirm_worker: не удалось отправить уведомление админу %d: %s", admin_id, e)
-
-        except Exception as e:
-            logger.exception("autoconfirm_worker: ошибка в основном цикле: %s", e)
+                    await bot.send_message(admin_id, note_for_admins)
+                except Exception:
+                    pass
 
         await asyncio.sleep(60)
 
@@ -2641,9 +2724,15 @@ async def day_cmd(m: Message):
 
     async with SessionLocal() as s:
         # подчистим протухшие pending
-        cleaned = await cleanup_expired_pending(s)
-        if cleaned:
-            logger.info("day_cmd: отменено %d протухших pending-брони(й) перед построением расписания", cleaned)
+        await s.execute(
+    text("""UPDATE bookings
+            SET status='cancelled'
+            WHERE status='pending'
+              AND expires_at IS NOT NULL
+              AND expires_at < :now"""),
+    {"now": datetime.now(TZ)}
+)
+        await s.commit()
 
         q = (
             select(Booking)
@@ -2688,7 +2777,26 @@ async def day_cmd(m: Message):
 
 # ===== PROMOCODES (in-memory) =====
 # Примеры с лимитами и минималкой
-
+PROMO_RULES = {
+    # одноразовый -10% для каждого пользователя, общий лимит 500 применений
+    "WELCOME10": {
+        "kind": "percent", "value": 10,
+        "until": date(2099, 1, 1),
+        "one_time": True,
+        "per_user_limit": 1,   # раз на пользователя
+        "total_limit": 500,    # общий лимит
+        "min_total": 0,        # минимальная сумма заказа
+    },
+    # фиксированная скидка 100 ₽, минимум чек 600 ₽
+    "FIX100": {
+        "kind": "fixed", "value": 100,
+        "until": date(2099, 1, 1),
+        "one_time": True,
+        "per_user_limit": 3,
+        "total_limit": 1000,
+        "min_total": 600,
+    },
+}
 
 # user_id -> {"code": str, "rule": dict}
 PROMOS_PENDING: dict[int, dict] = {}
@@ -2763,7 +2871,7 @@ def _ics_text_for_booking(b: Booking) -> str:
         f"DTSTART:{b.start_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}\n"
         f"DTEND:{b.end_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}\n"
         f"SUMMARY:Симрейсинг — {b.sims} {sims_word(b.sims)}\n"
-        f"LOCATION:{ADDRESS_FULL}\n"
+        "LOCATION:Екатеринбург, Академический\n"
         f"DESCRIPTION:{b.sims} {sims_word(b.sims)}, {b.duration} мин\nEND:VEVENT\nEND:VCALENDAR\n"
     )
 
@@ -2912,23 +3020,26 @@ async def catch_free_contact(m: Message):
 async def cleanup_pending_worker():
     while True:
         try:
-            now_local = datetime.now(TZ)
             async with SessionLocal() as s:
-                cleaned = await cleanup_expired_pending(s, now_local)
-            if cleaned:
-                logger.info(
-                    "cleanup_pending_worker: отменено %d протухших pending-брони(й) на %s",
-                    cleaned, now_local.isoformat()
-                )
-            # если cleaned == 0 — молчим, чтобы не спамить лог
+                await s.execute(
+    text("""UPDATE bookings
+            SET status='cancelled'
+            WHERE status='pending'
+              AND expires_at IS NOT NULL
+              AND expires_at < :now"""),
+    {"now": datetime.now(TZ)}
+)
+                await s.commit()
         except Exception:
-            logger.exception("cleanup_pending_worker: ошибка при очистке pending")
+            pass
         await asyncio.sleep(60)
 
 # ====================== RUN =========================
 
 async def main():
+    await ensure_tables()
     print("Bot started ✅")
+    await setup_commands()
 
     # Проверка токена
     try:
