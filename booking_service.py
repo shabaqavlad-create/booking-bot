@@ -3,9 +3,11 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import select, text
 
+from utils import _ensure_tz
 from config import TZ, MAX_SIMS, HOLD_MINUTES
 from db import SessionLocal, Booking
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func
 # какие статусы считаем "занимающими симы"
 ACTIVE_STATUSES = ("pending", "confirmed", "block")
 
@@ -49,10 +51,10 @@ async def free_sims_for_interval(
         if exclude_id is not None:
             conditions.append(Booking.id != exclude_id)
 
-        q = select(Booking).where(*conditions)
+        q = select(func.coalesce(func.sum(Booking.sims), 0)).where(*conditions)
         result = await s.execute(q)
         bookings = result.scalars().all()
-        busy = sum(b.sims for b in bookings)
+        busy = (await s.execute(q)).scalar_one()
 
     free = MAX_SIMS - busy
     return max(free, 0)

@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # Если хочешь — перенеси TZ сюда, но можно оставить в config
-from config import TZ
+from config import TZ, PRICES
 
 RU_MONTHS = [
     "",
@@ -79,3 +79,12 @@ def split_contact(raw: str) -> tuple[str, str]:
         name, phone = raw, ""
 
     return name.strip(), normalize_phone(phone)
+
+def price_for(duration: int, sims: int) -> int:
+    return PRICES[duration] * sims
+
+def _ensure_tz(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
+
+start = _ensure_tz(start)
+end   = _ensure_tz(end)

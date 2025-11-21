@@ -71,6 +71,8 @@ from utils import (
     looks_like_contact,
     split_contact,
     RU_MONTHS,
+    price_for,
+    _ensure_tz
 )
 
 # --- Address & map (Yandex) ---
@@ -231,11 +233,6 @@ def build_day_timetable(bookings: list[Booking], target_date: date) -> str:
     )
     return header + "\n" + "\n".join(lines)
 
-RU_MONTHS = [
-    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
-]
-
 def build_month_kb(year: int, month: int, duration: int):
     cal = calendar.Calendar(firstweekday=0)
     weeks = cal.monthdayscalendar(year, month)
@@ -366,11 +363,6 @@ def gen_slots(day_dt: datetime, step_min=30):
         slots.append(cur)
         cur += step
     return slots
-
-
-def price_for(duration: int, sims: int) -> int:
-    return PRICES[duration] * sims
-
 
 def confirm_user_kb(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1223,7 +1215,7 @@ async def book_finalize(m: Message, state: FSMContext):
     if applied:
         code = applied["code"]
         rule = applied["rule"]
-        _promo_mark_used(code, m.from_user.id)
+        _promo_mark_used(code, m.from_user.id, rule)
         promo_note = f" (со скидкой по коду {code})"
 
     # Сообщаем юзеру
@@ -2888,15 +2880,6 @@ async def main():
     except Exception as e:
         print(f"BOT_TOKEN problem? get_me failed: {e}")
         return
-
-    # Сброс webhook перед polling
-    try:
-        info = await bot.get_webhook_info()
-        if info.url:
-            print(f"Webhook was set to: {info.url} — removing...")
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print(f"delete_webhook failed: {e}")
 
     # Просто ждём polling; startup/shutdown сами поднимут/погасят BG_TASKS
     await dp.start_polling(bot, polling_timeout=60)
