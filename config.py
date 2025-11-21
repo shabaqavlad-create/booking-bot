@@ -1,4 +1,4 @@
-# config.py
+# config.py # конфиг
 import os
 import logging
 from datetime import timedelta, time, timezone

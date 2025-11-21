@@ -1,4 +1,4 @@
-# db.py
+# db.py # модели и база
 import os
 from datetime import datetime
 

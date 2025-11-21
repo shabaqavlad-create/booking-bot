@@ -1,3 +1,5 @@
+ # точка входа + хендлеры
+
 import os
 import asyncio
 import calendar
@@ -57,6 +59,19 @@ from config import (
 from booking_service import free_sims_for_interval, create_pending_booking, cleanup_expired_pending
 
 from promo_service import PROMO_RULES, apply_promo
+
+from utils import (
+    human,
+    today_local,
+    localize,
+    human_status,
+    sims_word,
+    within_booking_window,
+    normalize_phone,
+    looks_like_contact,
+    split_contact,
+    RU_MONTHS,
+)
 
 # --- Address & map (Yandex) ---
 ADDRESS_FULL = "Екатеринбург, ул. Академика Парина, 35"
@@ -153,37 +168,6 @@ def short_booking_line(b: Booking) -> str:
         f"{(b.client_name or '-')} {(b.client_phone or '-')}"
     )
 
-
-PHONE_RE = re.compile(r"[\d\+\(\)\-\s]{6,}")
-
-
-def normalize_phone(p: str) -> str:
-    """Нормализует номер телефона в формат +7XXXXXXXXXX."""
-    p = p.strip()
-    digits = "".join(ch for ch in p if ch.isdigit())
-    if len(digits) < 10:
-        return ""
-    # 10-значный без кода страны, начинающийся с 9 -> Россия
-    if len(digits) == 10 and digits.startswith("9"):
-        digits = "7" + digits
-    # 11-значный, начинается с 8 -> Россия
-    if len(digits) == 11 and digits.startswith("8"):
-        digits = "7" + digits[1:]
-    # Всегда с +
-    return "+" + digits
-
-def looks_like_contact(raw: str) -> bool:
-    raw = raw.strip()
-    return bool(PHONE_RE.search(raw))
-
-def split_contact(raw: str) -> tuple[str, str]:
-    raw = raw.strip()
-    if "," in raw:
-        name_part, phone_part = raw.split(",", 1)
-    else:
-        name_part, phone_part = raw, ""
-    return name_part.strip(), normalize_phone(phone_part)
-
 def build_day_timetable(bookings: list[Booking], target_date: date) -> str:
     """
     Расписание на день (шаг 30 мин) с пометками статуса:
@@ -246,34 +230,6 @@ def build_day_timetable(bookings: list[Booking], target_date: date) -> str:
         f"Легенда статуса: ⏳ — ожидает подтверждения, ✅ — подтверждено, 🔧 — техперерыв"
     )
     return header + "\n" + "\n".join(lines)
-
-def sims_word(n: int) -> str:
-    n = abs(n) % 100
-    n1 = n % 10
-    if 11 <= n <= 19:
-        return "симов"
-    if n1 == 1:
-        return "сим"
-    if 2 <= n1 <= 4:
-        return "сима"
-    return "симов"
-
-def human_status(status: str) -> str:
-    mapping = {
-        "pending": "⏳ Ожидает подтверждения",
-        "confirmed": "✅ Подтверждено",
-        "done": "🏁 Завершено",
-        "no_show": "🚫 Не пришёл",
-        "cancelled": "❌ Отменено",
-        "block": "🔧 Техперерыв",  # ← добавить
-    }
-    return mapping.get(status, status)
-
-def today_local() -> date:
-    return datetime.now(TZ).date()
-
-def within_booking_window(d: date, days_ahead: int = 30) -> bool:
-    return today_local() <= d <= (today_local() + timedelta(days=days_ahead))
 
 RU_MONTHS = [
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -399,9 +355,6 @@ def build_month_kb_edit(year: int, month: int, bid: int, duration: int, sims: in
     rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def localize(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
-
 def gen_slots(day_dt: datetime, step_min=30):
     base = localize(day_dt).date()
     start_dt = datetime.combine(base, OPEN_T)
@@ -414,8 +367,6 @@ def gen_slots(day_dt: datetime, step_min=30):
         cur += step
     return slots
 
-def human(dt: datetime) -> str:
-    return localize(dt).strftime("%d.%m %H:%M")
 
 def price_for(duration: int, sims: int) -> int:
     return PRICES[duration] * sims

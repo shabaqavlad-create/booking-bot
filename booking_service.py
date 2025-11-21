@@ -1,4 +1,4 @@
-# booking_service.py
+# booking_service.py  # бизнес-логика брони
 from datetime import datetime, timedelta
 
 from sqlalchemy import select, text

@@ -1,4 +1,4 @@
-# promo_service.py
+# promo_service.py  # бизнес-логика промо
 from datetime import date
 from typing import Optional
 
