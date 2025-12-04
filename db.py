@@ -20,7 +20,10 @@ from sqlalchemy import (
     Index,
     CheckConstraint,
     Boolean,
+    Column,
+    Numeric,
 )
+from sqlalchemy.sql import func
 
 from config import DATABASE_URL, MAX_SIMS  # <-- вот это добавляем
 if not DATABASE_URL:
@@ -35,6 +38,26 @@ class Base(DeclarativeBase):
 
 
 # ================== MODELS =================
+
+class Client(Base):
+    __tablename__ = "clients"
+
+    id = Column(Integer, primary_key=True)
+    tg_user_id = Column(BigInteger, index=True, nullable=True)
+    phone = Column(String(32), index=True, nullable=True)
+    name = Column(String(255), nullable=True)
+
+    total_bookings = Column(Integer, default=0, nullable=False)
+    total_spent = Column(Integer, default=0, nullable=False)      # общая сумма в рублях
+    bonus_balance = Column(Integer, default=0, nullable=False)    # сколько бонусов накоплено
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now()
+    )
+
 class Waitlist(Base):
     __tablename__ = "waitlist"
     __table_args__ = (
@@ -98,7 +121,8 @@ class Booking(Base):
     duration: Mapped[int] = mapped_column(Integer, nullable=False)
     price: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-
+    bonus_applied = Column(Boolean, default=False, nullable=False)
+    
     created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

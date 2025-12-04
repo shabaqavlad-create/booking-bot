@@ -4,12 +4,11 @@ from datetime import datetime, timedelta
 from sqlalchemy import select, text
 
 from utils import _ensure_tz
-from config import TZ, MAX_SIMS, HOLD_MINUTES
-from db import SessionLocal, Booking
+from config import TZ, MAX_SIMS, HOLD_MINUTES, ACTIVE_STATUSES
+from db import SessionLocal, Booking, Client  
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func
-# какие статусы считаем "занимающими симы"
-ACTIVE_STATUSES = ("pending", "confirmed", "block")
+
 
 async def cleanup_expired_pending(session: AsyncSession, now: datetime | None = None) -> int:
     """
@@ -32,16 +31,10 @@ async def cleanup_expired_pending(session: AsyncSession, now: datetime | None = 
     await session.commit()
     return result.rowcount or 0
 
-async def free_sims_for_interval(
-    start: datetime,
-    end: datetime,
-    exclude_id: int | None = None,
-) -> int:
-    """
-    Сколько свободных симов в интервале [start, end).
-    Открывает свою сессию к БД.
-    Если передан exclude_id — не учитывает эту бронь в рассчёте.
-    """
+async def free_sims_for_interval(start: datetime, end: datetime, exclude_id: int | None = None) -> int:
+    start = _ensure_tz(start)
+    end = _ensure_tz(end)
+
     async with SessionLocal() as s:
         conditions = [
             Booking.status.in_(ACTIVE_STATUSES),
@@ -52,11 +45,9 @@ async def free_sims_for_interval(
             conditions.append(Booking.id != exclude_id)
 
         q = select(func.coalesce(func.sum(Booking.sims), 0)).where(*conditions)
-        result = await s.execute(q)
-        bookings = result.scalars().all()
         busy = (await s.execute(q)).scalar_one()
 
-    free = MAX_SIMS - busy
+    free = MAX_SIMS - int(busy)
     return max(free, 0)
 
 

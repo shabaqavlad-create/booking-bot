@@ -1,23 +1,15 @@
  # точка входа + хендлеры
-
 import os
 import asyncio
-import calendar
-import signal
-import re
 import contextlib
 from typing import Optional
 from datetime import datetime, timedelta, time, timezone, date
 import logging
 
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 import csv
 import tempfile
 
-from aiohttp import ClientTimeout
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.types import FSInputFile
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import StatesGroup, State
@@ -30,20 +22,25 @@ from aiogram.types import (
     InlineKeyboardButton,
     BotCommand,
     BotCommandScopeChat,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    FSInputFile,
+
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 
-
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
 
-from db import SessionLocal, Booking, Waitlist, ensure_tables
+from db import SessionLocal, Booking, Waitlist, ensure_tables, Client
 
 from config import (
     BOT_TOKEN,
     ADMINS,
+    MANAGERS,
     TZ,
     OPEN_T,
     CLOSE_T,
@@ -54,11 +51,13 @@ from config import (
     SAFETY_GAP,
     REMIND_BEFORE,
     AUTOCONFIRM_BEFORE,
+    ADDRESS_FULL, ADDRESS_AREA, ADDRESS_MAP_URL, HOWTO_TEXT,
+    ACTIVE_STATUSES
 )
 
 from booking_service import free_sims_for_interval, create_pending_booking, cleanup_expired_pending
 
-from promo_service import PROMO_RULES, apply_promo
+from promo_service import PROMO_RULES
 
 from utils import (
     human,
@@ -66,29 +65,29 @@ from utils import (
     localize,
     human_status,
     sims_word,
-    within_booking_window,
     normalize_phone,
     looks_like_contact,
     split_contact,
-    RU_MONTHS,
-    price_for,
-    _ensure_tz
+    price_for
 )
 
-# --- Address & map (Yandex) ---
-ADDRESS_FULL = "Екатеринбург, ул. Академика Парина, 35"
-ADDRESS_AREA = "Академический"
-ADDRESS_MAP_URL = "https://yandex.ru/maps/?text=%D0%95%D0%BA%D0%B0%D1%82%D0%B5%D1%80%D0%B8%D0%BD%D0%B1%D1%83%D1%80%D0%B3%2C%20%D1%83%D0%BB.%20%D0%90%D0%BA%D0%B0%D0%B4%D0%B5%D0%BC%D0%B8%D0%BA%D0%B0%20%D0%9F%D0%B0%D1%80%D0%B8%D0%BD%D0%B0%2C%2035"
-
-# Краткая памятка "Как добраться"
-HOWTO_TEXT = (
-    "🚶 Как добраться:\n"
-    f"• Мы находимся в районе {ADDRESS_AREA}, {ADDRESS_FULL}.\n"
-    "• Вход со стороны улицы.\n"
-    "• Парковка вдоль улицы, свободная.\n"
-    "• Если что — звоните: +7 953 046-36-54\n"
+from keyboards import (
+    main_menu_kb,
+    build_month_kb,
+    build_month_kb_edit,
+    build_admin_booking_kb,
+    build_tariffs_kb,
+    build_tariffs_qty_kb,
 )
 
+from services.bonus_runtime import BONUS_RATE, BONUS_MAX_SHARE, upsert_client_stats
+from services.promo_runtime import PROMOS_PENDING, PROMO_USAGE_TOTAL, PROMO_USAGE_PER_USER, apply_promo, _promo_mark_used
+from services.ics_service import send_ics
+from client_service import get_client_balance, get_client_by_tg, ensure_client
+from commands_service import refresh_user_commands
+
+
+STAFF_IDS = list(ADMINS.union(set(MANAGERS)))
 # user_id -> booking_id, который мы ждём контакт
 PENDING_CONTACTS: dict[int, int] = {}
 
@@ -106,6 +105,9 @@ class BookingContactForm(StatesGroup):
 class UpdateContactForm(StatesGroup):
     waiting_new_contact = State()
 
+class PromoForm(StatesGroup):
+    waiting_code = State()
+
 
 # Глобальный список фоновых задач, чтобы startup/shutdown могли им управлять
 BG_TASKS: list[asyncio.Task] = []
@@ -119,23 +121,41 @@ logging.getLogger("aiogram").setLevel(logging.INFO)
 
 
 async def setup_commands():
-    # команды для обычных пользователей
-    user_cmds = [
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="my", description="Мои активные заявки"),
-        BotCommand(command="edit", description="Изменить время заявки"),
-        BotCommand(command="cancel", description="Отменить заявку"),
-        BotCommand(command="help", description="Помощь"),
+    """
+    Глобальная настройка команд при старте бота.
+    """
+    # Базовые команды для обычных пользователей
+    base_user_cmds: list[BotCommand] = [
+        BotCommand(command="start",   description="Главное меню"),
+        BotCommand(command="my",      description="Мои активные заявки"),
+        BotCommand(command="map",     description="Как нас найти"),
+        BotCommand(command="support", description="Связаться"),
+        BotCommand(command="help",    description="Помощь"),
     ]
 
-    # дефолтные команды для всех
-    await bot.set_my_commands(commands=user_cmds)
+    # По умолчанию — эти команды для всех
+    await bot.set_my_commands(commands=base_user_cmds)
 
-    # команды для админов (добавим /day)
-    admin_cmds = user_cmds + [
+    # Отдельный набор команд для менеджеров
+    manager_cmds: list[BotCommand] = [
+        BotCommand(command="day",  description="Расписание по дням"),
+        BotCommand(command="help", description="Подсказка по кнопкам"),
+    ]
+    for manager_id in MANAGERS:
+        try:
+            await bot.set_my_commands(
+                commands=manager_cmds,
+                scope=BotCommandScopeChat(chat_id=manager_id),
+            )
+        except Exception:
+            # если боту ещё не писали или нет прав — просто пропускаем
+            pass
+
+    # Расширенный набор для админов (и юзер, и служебные)
+    admin_cmds = base_user_cmds + [
         BotCommand(command="day", description="Расписание по дням"),
+        BotCommand(command="csv", description="Экспорт отчёта CSV"),  # если есть такая команда
     ]
-
     for admin_id in ADMINS:
         try:
             await bot.set_my_commands(
@@ -143,8 +163,8 @@ async def setup_commands():
                 scope=BotCommandScopeChat(chat_id=admin_id),
             )
         except Exception:
-            # если бот ещё не писал админу
             pass
+
 
 async def safe_edit_text(msg, *args, **kwargs):
     try:
@@ -198,7 +218,7 @@ def build_day_timetable(bookings: list[Booking], target_date: date) -> str:
         overlapping: list[Booking] = []
         for b in bookings_sorted:
             # было: if b.status in ("pending", "confirmed"):
-            if b.status in ("pending", "confirmed", "block"):
+            if b.status in ACTIVE_STATUSES:
                 if b.start_at < cur_end and b.end_at > cur:
                     overlapping.append(b)
 
@@ -233,125 +253,6 @@ def build_day_timetable(bookings: list[Booking], target_date: date) -> str:
     )
     return header + "\n" + "\n".join(lines)
 
-def build_month_kb(year: int, month: int, duration: int):
-    cal = calendar.Calendar(firstweekday=0)
-    weeks = cal.monthdayscalendar(year, month)
-
-    rows = [[InlineKeyboardButton(text=f"{RU_MONTHS[month]} {year}", callback_data="noop")]]
-
-    rows.append([InlineKeyboardButton(text=t, callback_data="noop") for t in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
-
-    for w in weeks:
-        row = []
-        for day in w:
-            if day == 0:
-                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
-                continue
-            d = date(year, month, day)
-            if within_booking_window(d):
-                row.append(
-                    InlineKeyboardButton(
-                        text=str(day),
-                        callback_data=f"book:date:{d.isoformat()}:{duration}"
-                    )
-                )
-            else:
-                row.append(InlineKeyboardButton(text="·", callback_data="noop"))
-        rows.append(row)
-
-    cur_first = date(year, month, 1)
-    prev_month = (cur_first - timedelta(days=1)).replace(day=1)
-    next_month = (cur_first + timedelta(days=32)).replace(day=1)
-
-    nav = []
-    if prev_month >= today_local().replace(day=1):
-        nav.append(
-            InlineKeyboardButton(
-                text="◀️",
-                callback_data=f"cal:page:{prev_month.year}-{prev_month.month}:{duration}"
-            )
-        )
-    else:
-        nav.append(InlineKeyboardButton(text=" ", callback_data="noop"))
-
-    nav.append(InlineKeyboardButton(text="Закрыть", callback_data=f"book:dur:{duration}"))
-
-    last_allowed = today_local() + timedelta(days=30)
-    if next_month <= last_allowed.replace(day=1):
-        nav.append(
-            InlineKeyboardButton(
-                text="▶️",
-                callback_data=f"cal:page:{next_month.year}-{next_month.month}:{duration}"
-            )
-        )
-    else:
-        nav.append(InlineKeyboardButton(text=" ", callback_data="noop"))
-
-    rows.append(nav)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def build_month_kb_edit(year: int, month: int, bid: int, duration: int, sims: int):
-    cal = calendar.Calendar(firstweekday=0)
-    weeks = cal.monthdayscalendar(year, month)
-
-    rows = [[InlineKeyboardButton(text=f"{RU_MONTHS[month]} {year}", callback_data="noop")]]
-
-    rows.append([InlineKeyboardButton(text=t, callback_data="noop") for t in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
-
-    for w in weeks:
-        row = []
-        for day in w:
-            if day == 0:
-                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
-                continue
-            d = date(year, month, day)
-            if within_booking_window(d):
-                row.append(
-                    InlineKeyboardButton(
-                        text=str(day),
-                        callback_data=f"edit:date:{bid}:{d.isoformat()}:{duration}:{sims}"
-                    )
-                )
-            else:
-                row.append(InlineKeyboardButton(text="·", callback_data="noop"))
-        rows.append(row)
-
-    cur_first = date(year, month, 1)
-    prev_month = (cur_first - timedelta(days=1)).replace(day=1)
-    next_month = (cur_first + timedelta(days=32)).replace(day=1)
-
-    nav = []
-    if prev_month >= today_local().replace(day=1):
-        nav.append(
-            InlineKeyboardButton(
-                text="◀️",
-                callback_data=f"editcal:page:{bid}:{prev_month.year}-{prev_month.month}:{duration}:{sims}"
-            )
-        )
-    else:
-        nav.append(InlineKeyboardButton(text=" ", callback_data="noop"))
-
-    nav.append(
-        InlineKeyboardButton(
-            text="Закрыть",
-            callback_data="noop"
-        )
-    )
-
-    last_allowed = today_local() + timedelta(days=30)
-    if next_month <= last_allowed.replace(day=1):
-        nav.append(
-            InlineKeyboardButton(
-                text="▶️",
-                callback_data=f"editcal:page:{bid}:{next_month.year}-{next_month.month}:{duration}:{sims}"
-            )
-        )
-    else:
-        nav.append(InlineKeyboardButton(text=" ", callback_data="noop"))
-
-    rows.append(nav)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 def gen_slots(day_dt: datetime, step_min=30):
     base = localize(day_dt).date()
     start_dt = datetime.combine(base, OPEN_T)
@@ -363,6 +264,15 @@ def gen_slots(day_dt: datetime, step_min=30):
         slots.append(cur)
         cur += step
     return slots
+
+def contact_request_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить мой телефон", request_contact=True)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 def confirm_user_kb(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -382,58 +292,72 @@ def confirm_user_kb(bid: int) -> InlineKeyboardMarkup:
         ]
     )
 
-# --------------- KEYBOARDS & MENUS ------------------
-def main_menu_kb():
+def build_admin_booking_kb_confirmed(bid: int) -> InlineKeyboardMarkup:
+    """
+    Клавиатура для админа ПОСЛЕ подтверждения заявки:
+    оставляем только кнопки 'Пришёл' / 'Не пришёл',
+    чтобы не было соблазна ещё раз подтверждать/отклонять.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Забронировать", callback_data="book:start")],
-            [InlineKeyboardButton(text="📄 Мои заявки", callback_data="my:list")],
             [
-                InlineKeyboardButton(text="💳 Тарифы", callback_data="tariffs"),
-                InlineKeyboardButton(text="🕒 Часы работы", callback_data="hours")
+                InlineKeyboardButton(
+                    text="🚫 Не пришёл",
+                    callback_data=f"admin:noshow:{bid}",
+                ),
+                InlineKeyboardButton(
+                    text="🏁 Пришёл",
+                    callback_data=f"admin:done:{bid}",
+                ),
             ],
-            [InlineKeyboardButton(text="📍 Адрес", callback_data="address")],  # 👈 добавили
-            [InlineKeyboardButton(text="📚 Помощь", callback_data="help:open")],
-            [InlineKeyboardButton(text="📞 Связаться", callback_data="contact")]
         ]
     )
 
-
 # ===================== HANDLERS =====================
+
+@dp.message(Command("support"))
+async def support_cmd(m: Message):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗺 Открыть карту", url=ADDRESS_MAP_URL)],
+        ]
+    )
+    await m.answer(
+        "📞 Связаться с администратором:\n"
+        "• Телефон: +7 953 046-36-54\n"
+        "• Telegram: @shaba_V\n\n"
+        f"📍 Адрес: {ADDRESS_FULL} ({ADDRESS_AREA})",
+        reply_markup=kb
+    )
+
+@dp.message(Command("map"))
+async def map_cmd(m: Message):
+    await m.answer(
+        f"📍 Мы находимся: {ADDRESS_FULL} ({ADDRESS_AREA})\n\n"
+        "Открыть карту: " + ADDRESS_MAP_URL
+    )
+
 
 @dp.message(Command("ics"))
 async def ics_cmd(m: Message):
     parts = m.text.split()
-    if len(parts)!=2 or not parts[1].isdigit():
-        await m.answer("Использование: /ics ID"); return
+    if len(parts) != 2 or not parts[1].isdigit():
+        await m.answer("Использование: /ics ID")
+        return
+
     bid = int(parts[1])
     async with SessionLocal() as s:
         b = await s.get(Booking, bid)
         if not b or b.user_id != m.from_user.id:
-            await m.answer("Заявка не найдена."); return
+            await m.answer("Заявка не найдена.")
+            return
+
     if b.status not in ("confirmed", "done"):
-        await m.answer("ICS доступен после подтверждения."); return
+        await m.answer("ICS доступен после подтверждения.")
+        return
 
-    import uuid, tempfile
-    uid = uuid.uuid4().hex
-    ics = (
-        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//simclub//ru//\nBEGIN:VEVENT\n"
-        f"UID:{uid}\nDTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}\n"
-        f"DTSTART:{b.start_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}\n"
-        f"DTEND:{b.end_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}\n"
-        "SUMMARY:Симрейсинг\nLOCATION:Екатеринбург, Академический\n"
-        f"DESCRIPTION:{b.sims} сим(ов), {b.duration} мин\nEND:VEVENT\nEND:VCALENDAR\n"
-    )
-
-    path = None
-    try:
-        fd, path = tempfile.mkstemp(prefix=f"booking_{bid}_", suffix=".ics")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(ics)
-        await m.answer_document(FSInputFile(path), caption=f"Календарь для брони #{bid}")
-    finally:
-        if path and os.path.exists(path):
-            os.remove(path)
+    await send_ics(bot, m.from_user.id, b)
+    await m.answer("Файл календаря отправлен ✅")
 
 @dp.callback_query(F.data.startswith("contact:ask:"))
 async def contact_ask_cb(c: CallbackQuery, state: FSMContext):
@@ -442,9 +366,14 @@ async def contact_ask_cb(c: CallbackQuery, state: FSMContext):
         b = await s.get(Booking, bid)
         if not b or b.user_id != c.from_user.id:
             await c.answer("Заявка не найдена", show_alert=True); return
+
     await state.update_data(bid=bid)
     await state.set_state(UpdateContactForm.waiting_new_contact)
-    await c.message.answer("Пришли новые данные: Имя, телефон\nНапример: Игорь, +7 999 123-45-67")
+    await c.message.answer(
+        "Пришли новые данные: Имя, телефон\nНапример: Игорь, +7 999 123-45-67\n\n"
+        "Или нажми кнопку ниже, чтобы отправить номер из Telegram 👇",
+        reply_markup=contact_request_kb(),
+    )
     await c.answer()
 
 @dp.callback_query(F.data.startswith("cancel:ask:"))
@@ -468,10 +397,35 @@ async def cancel_do_cb(c: CallbackQuery):
             await c.answer("Нельзя отменить — время уже наступило.", show_alert=True); return
         if b.status == "cancelled":
             await c.answer("Уже отменена"); return
-        b.status = "cancelled"; b.expires_at = None
+
+        b.status = "cancelled"
+        b.expires_at = None
+
+        # забираем данные до коммита
+        start_at = b.start_at
+        end_at = b.end_at
+        sims = b.sims
+        dur = b.duration
+        price = b.price
+
         await s.commit()
+
     await c.message.answer(f"❌ Заявка #{bid} отменена.")
     await c.answer()
+
+    # уведомление админам
+    uname = c.from_user.username or c.from_user.full_name
+    text = (
+        f"❌ Пользователь @{uname} отменил заявку #{bid}\n"
+        f"{human(start_at)}–{end_at.astimezone(TZ).strftime('%H:%M')} | "
+        f"{sims} {sims_word(sims)} | {dur} мин | {price} ₽\n"
+        f"Освободилось: {sims} {sims_word(sims)}"
+    )
+    for staff_id in STAFF_IDS:
+        try:
+            await bot.send_message(staff_id, text)
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "help:open")
 async def help_open_cb(c: CallbackQuery):
@@ -609,7 +563,6 @@ async def wait_cmd(m: Message):
         f"Сообщу, если окно освободится 👌"
     )
 
-
 @dp.message(Command("unwait"))
 async def unwait_cmd(m: Message):
     parts = m.text.strip().split()
@@ -639,6 +592,9 @@ async def start_cmd(m: Message):
         reply_markup=main_menu_kb()
     )
 
+    # обновим персональное меню команд для этого пользователя
+    await refresh_user_commands(bot, m.from_user.id)
+
 @dp.callback_query(F.data == "hours")
 async def hours_cb(c: CallbackQuery):
     await safe_edit_text(
@@ -650,27 +606,20 @@ async def hours_cb(c: CallbackQuery):
 
 @dp.callback_query(F.data == "tariffs")
 async def tariffs_cb(c: CallbackQuery):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"{d} мин — {PRICES[d]} ₽/сим", callback_data=f"tariffs:dur:{d}")]
-            for d in (30, 60, 90, 120)
-        ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home")]]
+    await safe_edit_text(
+        c.message,
+        "💳 Выбери длительность, посчитаю итог:",
+        reply_markup=build_tariffs_kb()
     )
-    await safe_edit_text(c.message, "💳 Выбери длительность, посчитаю итог:", reply_markup=kb)
     await c.answer()
 
 @dp.callback_query(F.data.startswith("tariffs:dur:"))
 async def tariffs_pick_qty(c: CallbackQuery):
     duration = int(c.data.split(":")[-1])
-    rows = [[InlineKeyboardButton(
-        text=f"{n} — {price_for(duration, n)} ₽ итого",
-        callback_data=f"tariffs:qty:{duration}:{n}"
-    )] for n in range(1, MAX_SIMS+1)]
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tariffs")])
     await safe_edit_text(
         c.message,
         f"Длительность: {duration} мин\nЦена за 1 сим: {PRICES[duration]} ₽\nВыбери количество:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+        reply_markup=build_tariffs_qty_kb(duration)
     )
     await c.answer()
 
@@ -1068,37 +1017,243 @@ async def book_qty_confirm_ask_contact(c: CallbackQuery, state: FSMContext):
         await c.answer("Упс, слот только что заняли. Выбери другое время.", show_alert=True)
         return
 
+    # считаем цену и промо
     base_price = price_for(duration, sims)
-    final_price, _promo_code = apply_promo(base_price, c.from_user.id)  # ← распаковка
-    price = final_price
+    final_price, _promo_code = apply_promo(base_price, c.from_user.id)
+    price_after_promo = final_price
 
-    # Кладём это всё во временное состояние пользователя:
+    # смотрим бонусы
+    bonus_balance = 0
+    max_bonus_use = 0
+    if price_after_promo > 0:
+        async with SessionLocal() as s:
+            bonus_balance = await get_client_balance(s, c.from_user.id)
+        if bonus_balance > 0:
+            # максимум 50% от суммы
+            max_bonus_use = min(bonus_balance, price_after_promo // 2)
+
+    # сохраняем базу в FSM
     await state.update_data(
         start_ts=start_ts,
         duration=duration,
         sims=sims,
         end_ts=int(end.timestamp()),
-        price=price,
+        base_price=base_price,
+        price_after_promo=price_after_promo,
+        bonus_max=max_bonus_use,
+        bonus_used=0,   # пока не выбрали
     )
 
-    # Спрашиваем контакты
-    await state.set_state(BookingContactForm.waiting_contact)
+    # если бонусов использовать нечего — сразу просим контакт (старое поведение)
+    if max_bonus_use <= 0:
+        await state.update_data(
+            price_after_promo=price_after_promo,
+            bonus_planned=0,
+        )
+        await state.set_state(BookingContactForm.waiting_contact)
+
+        # Обновим старое сообщение (уберём кнопки бронирования)
+        await safe_edit_text(
+            c.message,
+            "Последний шаг 👇\nСейчас попрошу контакт 🙂"
+        )
+
+        # А тут уже просим контакт + даём кнопку
+        await c.message.answer(
+            (
+                "Напиши, как с тобой связаться.\n"
+                "Формат: Имя, телефон\n\n"
+                "Например:\n"
+                "Игорь, +7 999 123-45-67\n\n"
+                "Или нажми кнопку ниже, чтобы отправить телефон из Telegram 👇"
+            ),
+            reply_markup=contact_request_kb(),
+        )
+
+        await c.answer("Жду контакт 👌")
+        return
+
+    # иначе — предлагаем потратить бонусы
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Использовать {max_bonus_use} ₽ → к оплате {price_after_promo - max_bonus_use} ₽",
+                    callback_data=f"bonus:use:{max_bonus_use}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Не использовать, копить дальше",
+                    callback_data="bonus:skip"
+                )
+            ],
+        ]
+    )
+
     await safe_edit_text(
         c.message,
         (
+            f"🧮 Итого без бонусов: <b>{price_after_promo} ₽</b>\n\n"
+            f"🎁 На балансе: <b>{bonus_balance} ₽</b>\n"
+            f"Можно использовать сейчас до <b>{max_bonus_use} ₽</b> "
+            f"(не больше 50% стоимости).\n\n"
+            f"Как поступим?"
+        ),
+        reply_markup=kb
+    )
+    await c.answer()
+
+@dp.callback_query(F.data == "bonus:open")
+async def bonus_open_cb(c: CallbackQuery):
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Client)
+            .where(Client.tg_user_id == c.from_user.id)
+            .order_by(Client.id.desc())
+        )
+        client = res.scalars().first()
+
+    if client and client.bonus_balance > 0:
+        text = (
+            f"🎁 На твоём бонусном счёте сейчас <b>{client.bonus_balance} ₽</b>.\n"
+            "Ими можно оплатить до <b>50%</b> стоимости следующего визита."
+        )
+    else:
+        text = (
+            "🎁 У тебя пока нет бонусов.\n"
+            "После каждого посещения копится <b>5%</b> от суммы визита — "
+            "эти бонусы можно будет потратить на до <b>50%</b> следующей игры."
+        )
+
+    await c.message.answer(text, parse_mode="HTML")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("bonus:use:"))
+async def bonus_use_cb(c: CallbackQuery, state: FSMContext):
+    """
+    Пользователь выбрал вариант "использовать N бонусов".
+    Здесь мы ТОЛЬКО запоминаем желаемую сумму списания и показываем
+    пользователю предварительную цену. Реальное списание будет в book_finalize.
+    """
+    _, _, amount_str = c.data.split(":")
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        await c.answer("Некорректная сумма бонусов", show_alert=True)
+        return
+
+    data = await state.get_data()
+    price_after_promo = data["price_after_promo"]
+    bonus_max = data.get("bonus_max", 0)
+
+    # Перестраховка по всем фронтам: не больше max, не больше цены
+    bonus_used = min(amount, bonus_max, price_after_promo)
+    final_price_preview = price_after_promo - bonus_used
+
+    # Запоминаем, сколько клиент ХОЧЕТ списать
+    await state.update_data(
+        bonus_planned=bonus_used,
+    )
+
+    # Переводим FSM в ожидание контакта
+    await state.set_state(BookingContactForm.waiting_contact)
+
+    # Обновляем сообщение с выбором бонусов
+    await safe_edit_text(
+        c.message,
+        (
+            f"Ок! Списали бы бонусами <b>{bonus_used} ₽</b>.\n"
+            f"К оплате на месте останется <b>{final_price_preview} ₽</b>.\n"
+            "Теперь нужен контакт 🙂"
+        ),
+        reply_markup=None,
+    )
+
+    # Просим контакт отдельным сообщением
+    await c.message.answer(
+        (
+            "Напиши, как с тобой связаться:\n"
+            "Имя, телефон\n\n"
+            "Например:\n"
+            "Игорь, +7 999 123-45-67\n\n"
+            "Или нажми кнопку ниже, чтобы отправить номер из Telegram 👇"
+        ),
+        reply_markup=contact_request_kb(),
+    )
+
+    await c.answer("Бонусы учтены 👌")
+
+
+@dp.callback_query(F.data == "bonus:skip")
+async def bonus_skip_cb(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    price_after_promo = data["price_after_promo"]
+
+    await state.update_data(
+        price_after_promo=price_after_promo,
+        bonus_planned=0,
+    )
+
+    await state.set_state(BookingContactForm.waiting_contact)
+
+    await safe_edit_text(
+        c.message,
+        "Ок, бонусы оставляем копиться 🎁\nТеперь нужен контакт 🙂",
+        reply_markup=None,
+    )
+
+    await c.message.answer(
+        (
             "Последний шаг 👇\n"
-            "Напиши как с тобой связаться, пожалуйста.\n"
+            "Напиши, как с тобой связаться.\n"
             "Формат: Имя, телефон\n\n"
             "Например:\n"
-            "Игорь, +7 999 123-45-67"
-        )
+            "Игорь, +7 999 123-45-67\n\n"
+            "Или просто нажми кнопку ниже, чтобы отправить номер 👇"
+        ),
+        reply_markup=contact_request_kb(),
     )
-    await c.answer("Жду контакт 👌")
+
+    await c.answer("Бонусы не трогаем 👍")   
 
 @dp.message(UpdateContactForm.waiting_new_contact)
 async def update_contact_finish(m: Message, state: FSMContext):
-    client_name, client_phone = split_contact(m.text)
+    # 1) Если пользователь нажал "Поделиться контактом"
+    if m.contact:
+        client_name = m.contact.first_name or ""
+        if m.contact.last_name:
+            client_name += f" {m.contact.last_name}"
+        client_name = client_name.strip()
+        client_phone = m.contact.phone_number
 
+    else:
+        # 2) Если контакт приходит текстом — проверяем, что текст есть и похож на контакт
+        if not m.text:
+            await m.answer(
+                "Не понял контакт 🤔\n"
+                "Пришли, пожалуйста, в формате:\n"
+                "Имя, телефон\n\n"
+                "Например:\n"
+                "Игорь, +7 999 123-45-67\n\n"
+                "Или нажми кнопку ниже, чтобы отправить номер из Telegram 👇",
+                reply_markup=contact_request_kb(),
+            )
+            return
+
+        if not looks_like_contact(m.text):
+            await m.answer(
+                "Похоже, это не контакт 🤔\n"
+                "Пришли данные в формате: Имя, телефон\n"
+                "Например: Игорь, +7 999 123-45-67\n\n"
+                "Или просто нажми кнопку «📱 Отправить мой телефон» 👇",
+                reply_markup=contact_request_kb(),
+            )
+            return
+
+        client_name, client_phone = split_contact(m.text)
+
+    # дальше всё как было
     data = await state.get_data()
     bid = data["bid"]
 
@@ -1110,7 +1265,7 @@ async def update_contact_finish(m: Message, state: FSMContext):
             await state.clear()
             return
 
-        # тут больше НЕ проверяем b.status == "pending"
+        # контакт можно менять в любом статусе
         b.client_name = client_name
         b.client_phone = client_phone
         await s.commit()
@@ -1129,7 +1284,8 @@ async def update_contact_finish(m: Message, state: FSMContext):
         f"{sims} {sims_word(sims)} | {dur} мин | {price} ₽\n"
         f"Теперь указано:\n"
         f"{client_name}, {client_phone}\n\n"
-        "Администратор получил новые данные 👌"
+        "Администратор получил новые данные 👌",
+        reply_markup=ReplyKeyboardRemove()
     )
 
     admin_text = (
@@ -1138,13 +1294,15 @@ async def update_contact_finish(m: Message, state: FSMContext):
         f"{sims} {sims_word(sims)} | {dur} мин | {price} ₽\n"
         f"Новый контакт: {client_name}, {client_phone}"
     )
-    for admin_id in ADMINS:
+    for staff_id in STAFF_IDS:
         try:
-            await bot.send_message(admin_id, admin_text)
+            await bot.send_message(staff_id, text)
         except Exception:
             pass
 
     await state.clear()
+
+    #  константы
 
 REF_DISCOUNT_PERCENT = 5
 REF_TOTAL_LIMIT = 200   # общий лимит по каждому реф-коду
@@ -1167,24 +1325,78 @@ async def ref_cmd(m: Message):
         "owner_id": owner_id,              # владелец не может применить сам
     }
     await m.answer(
-        "Твой реферальный код:\n"
+        f"Твой реферальный код:\n"
         f"<code>{code}</code>\n\n"
         f"Даст другу {REF_DISCOUNT_PERCENT}% скидки.\n"
         f"Каждый новый пользователь может применить 1 раз.\n"
-        f"Ты — не можешь использовать свой код."
+        f"Ты — не можешь использовать свой код.",
+        reply_markup=ReplyKeyboardRemove()
     )
+
+async def apply_bonus_for_booking(session: AsyncSession, booking: Booking):
+    """
+    Начисляет бонусы за бронь, если:
+    - статус == 'done'
+    - бонусы ещё не были начислены (booking.bonus_applied == False)
+
+    Ничего не коммитит, это делает вызывающий код.
+    """
+    if booking.status != "done":
+        return
+
+    if getattr(booking, "bonus_applied", False):
+        # уже начисляли — выходим
+        return
+
+    client_name = booking.client_name
+    client_phone = booking.client_phone
+    tg_user_id = booking.user_id
+    amount = booking.price
+
+    if amount <= 0:
+        booking.bonus_applied = True
+        return
+
+    client, earned = await upsert_client_stats(
+        session,
+        tg_user_id=tg_user_id,
+        name=client_name,
+        phone=client_phone,
+        add_spent=amount,
+    )
+
+    booking.bonus_applied = True
+
+    # 👇 ДОБАВЬ ЭТО:
+    # после начисления бонусов обновим меню для пользователя
+    try:
+        await refresh_user_commands(bot, tg_user_id)
+    except Exception:
+        pass
+
+    return client, earned
 
 # ---------- Пользователь прислал контакт (имя + телефон) ----------
 @dp.message(BookingContactForm.waiting_contact)
 async def book_finalize(m: Message, state: FSMContext):
-    client_name, client_phone = split_contact(m.text)
+    # Если пришёл Telegram-контакт
+    if m.contact:
+        client_name = m.contact.first_name
+        if m.contact.last_name:
+            client_name += f" {m.contact.last_name}"
+        client_phone = m.contact.phone_number
+    else:
+        client_name, client_phone = split_contact(m.text)
 
     data = await state.get_data()
     start_ts = data["start_ts"]
     end_ts = data["end_ts"]
     duration = data["duration"]
     sims = data["sims"]
-    price = data["price"]
+
+    # цена после промокода, но ДО бонусов
+    price_after_promo = data["price_after_promo"]
+    bonus_planned = int(data.get("bonus_planned", 0))
 
     start = datetime.fromtimestamp(start_ts, tz=TZ)
     end = datetime.fromtimestamp(end_ts, tz=TZ)
@@ -1195,6 +1407,28 @@ async def book_finalize(m: Message, state: FSMContext):
         await state.clear()
         return
 
+    # считаем финальную цену и реально списываем бонусы
+    final_price = price_after_promo
+    bonus_used_real = 0
+
+    async with SessionLocal() as s:
+        # найдём/создадим клиента
+        client = await ensure_client(s, m.from_user.id, client_name, client_phone)
+
+        if bonus_planned > 0 and price_after_promo > 0:
+            # перестраховка: баланс, план и 50% от суммы
+            can_use = min(
+                bonus_planned,
+                client.bonus_balance,
+                int(price_after_promo * BONUS_MAX_SHARE),
+            )
+            if can_use > 0:
+                client.bonus_balance -= can_use
+                bonus_used_real = can_use
+                final_price = price_after_promo - can_use
+
+        await s.commit()
+
     # создаём бронирование через сервисный слой
     b = await create_pending_booking(
         user_id=m.from_user.id,
@@ -1204,12 +1438,18 @@ async def book_finalize(m: Message, state: FSMContext):
         end=end,
         sims=sims,
         duration=duration,
-        price=price,
+        price=final_price,
     )
     booking_id = b.id
     expires_local = b.expires_at.astimezone(TZ)
 
-    # дальше оставляем твою логику промокодов, уведомлений и т.п. без изменений
+    bonus_line = (
+        "\n\n🎁 У нас работает бонусная программа: "
+        "после фактического посещения копится 5% от суммы, "
+        "которыми можно оплатить до 50% следующего визита."
+    )
+
+    # промокод
     applied = PROMOS_PENDING.pop(m.from_user.id, None)
     promo_note = ""
     if applied:
@@ -1218,73 +1458,76 @@ async def book_finalize(m: Message, state: FSMContext):
         _promo_mark_used(code, m.from_user.id, rule)
         promo_note = f" (со скидкой по коду {code})"
 
+    # текст про списанные бонусы для пользователя
+    bonus_note = ""
+    if bonus_used_real > 0:
+        bonus_note = f"\nСписано бонусами: <b>{bonus_used_real} ₽</b>."
+
     # Сообщаем юзеру
     await m.answer(
         f"📝 Заявка #{booking_id} отправлена администратору.\n\n"
         f"Дата: <b>{human(start)}–{end.strftime('%H:%M')}</b>\n"
         f"Симуляторов: <b>{sims} {sims_word(sims)}</b>\n"
         f"Длительность: <b>{duration} мин</b>\n"
-        f"Сумма: <b>{price} ₽</b>{promo_note}\n"
+        f"Сумма: <b>{final_price} ₽</b>{promo_note}{bonus_note}\n"
         f"Контакт: <b>{client_name}</b>, {client_phone}\n\n"
         f"Статус: <b>ожидает подтверждения</b> (до {expires_local.strftime('%H:%M')})."
+        f"{bonus_line}",
+        reply_markup=ReplyKeyboardRemove()
     )
 
     # уведомление админам
-    kb = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="✅ Подтвердить",
-                callback_data=f"admin:approve:{booking_id}"
-            ),
-            InlineKeyboardButton(
-                text="❌ Отклонить",
-                callback_data=f"admin:reject:{booking_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="📞 Контакт",
-                callback_data=f"admin:contact:{booking_id}"
-            ),
-            InlineKeyboardButton(
-                text="✏ Запросить контакт",
-                callback_data=f"admin:askcontact:{booking_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🚫 Не пришёл",
-                callback_data=f"admin:noshow:{booking_id}"
-            ),
-            InlineKeyboardButton(
-                text="🏁 Пришёл",
-                callback_data=f"admin:done:{booking_id}"
-            ),
-        ],
-    ]
-)
+    kb = build_admin_booking_kb(booking_id)
     uname = m.from_user.username or m.from_user.full_name
+    admin_bonus_note = f" (−{bonus_used_real} ₽ бонусами)" if bonus_used_real > 0 else ""
+
     txt = (
         f"🆕 Заявка #{booking_id} от @{uname}\n"
         f"{human(start)}–{end.strftime('%H:%M')} | "
-        f"{sims} {sims_word(sims)} | {duration} мин | {price} ₽{promo_note}\n"
+        f"{sims} {sims_word(sims)} | {duration} мин | {final_price} ₽{promo_note}{admin_bonus_note}\n"
         f"Имя: {client_name}\n"
         f"Тел: {client_phone}"
     )
-    for admin_id in ADMINS:
+
+    for staff_id in STAFF_IDS:
         try:
-            await bot.send_message(admin_id, txt, reply_markup=kb)
+            await bot.send_message(staff_id, text)
         except Exception:
             pass
 
     # чистим состояние
     await state.clear()
     await m.answer(
-    "Готово 🙌 Заявка отправлена админу. "
-    "Если нужно посмотреть статус — команда /my.\n"
-    "Вернуться в меню — /start"
-)
+        "Готово 🙌 Заявка отправлена админу. "
+        "Если нужно посмотреть статус — команда /my.\n"
+        "Вернуться в меню — /start"
+    )
+
+@dp.message(Command("bonus"))
+async def bonus_cmd(m: Message):
+    async with SessionLocal() as s:
+        result = await s.execute(
+            select(Client)
+            .where(Client.tg_user_id == m.from_user.id)
+            .order_by(Client.id.desc())
+        )
+        client = result.scalars().first()
+
+    if not client or client.bonus_balance <= 0:
+        await m.answer(
+            "🎁 У тебя пока нет бонусов.\n\n"
+            "За каждую игру после посещения копится <b>5%</b> от суммы визита, "
+            "которыми можно оплатить до <b>50%</b> следующего."
+        )
+        return
+
+    await m.answer(
+        f"🎁 Твой бонусный баланс: <b>{client.bonus_balance} ₽</b>\n\n"
+        "Ими можно оплатить до <b>50%</b> стоимости следующего визита.\n"
+        "При новом бронировании я предложу списать часть бонусов перед подтверждением 😉"
+    )
+
+    await refresh_user_commands(bot, m.from_user.id)
 
 # -------- Edit booking (время) --------
 @dp.callback_query(F.data.startswith("editcal:open:"))
@@ -1448,11 +1691,19 @@ async def report_cmd(m: Message):
     # строим текстовый отчёт
 
     # 1. хедер и метрики
+    bonus_sum = sum(
+        int(b.price * BONUS_RATE)
+        for b in bookings
+        if b.status == "done" and getattr(b, "bonus_applied", False)
+    )
+
+    # 1. хедер и метрики
     head_lines = [
         f"📊 Отчёт за {target_date.strftime('%d.%m.%Y')}",
         "",
         f"🏁 Пришли (done): {len(done_list)} шт.",
         f"💰 Выручка (по done): {revenue_sum} ₽",
+        f"🎁 Начислено бонусов за день: {bonus_sum} ₽",
         "",
         f"🚫 Не пришли / кандидаты: {len(noshow_list)}",
         f"❌ Отменены заранее (cancelled): {len(cancelled_list)}",
@@ -1511,7 +1762,6 @@ async def report_cmd(m: Message):
     # но наш отчёт в обычный день туда влезет. Если прямо будет адово много,
     # можно потом нарезать. Пока отправляем одним куском.
     await m.answer(text_report)
-
 
 @dp.callback_query(F.data.startswith("editcal:page:"))
 async def edit_cal_page(c: CallbackQuery):
@@ -1630,8 +1880,7 @@ async def _edit_show_times(c: CallbackQuery, bid: int, target_date: date, durati
     slots = [
         s for s in slots
         if (target_date != today_local() or s > now_local + timedelta(minutes=10))
-        and (s + timedelta(minutes=duration) <= (close_dt - SAFETY_GAP)
-)
+        and (s + timedelta(minutes=duration) <= (close_dt - SAFETY_GAP))
     ]
 
     rows = []
@@ -1720,103 +1969,74 @@ async def edit_apply(c: CallbackQuery):
         )
     )
 
-    kb_admin = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Подтвердить",
-                    callback_data=f"admin:approve:{bid}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"admin:reject:{bid}"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📞 Контакт",
-                    callback_data=f"admin:contact:{bid}"
-                ),
-                InlineKeyboardButton(
-                    text="✏ Запросить контакт",
-                    callback_data=f"admin:askcontact:{bid}"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚫 Не пришёл",
-                    callback_data=f"admin:noshow:{bid}"
-                ),
-                InlineKeyboardButton(
-                    text="🏁 Пришёл",
-                    callback_data=f"admin:done:{bid}"
-                ),
-            ],
-        ]
-    )
-
-    uname = c.from_user.username or c.from_user.full_name
-    txt_admin = (
-        f"♻️ Обновлена заявка #{bid} от @{uname}\n"
-        f"{human(start)}–{end.strftime('%H:%M')} | "
-        f"{sims} {sims_word(sims)} | {duration} мин | {b_price} ₽\n"
-        f"Имя: {client_name}\n"
-        f"Тел: {client_phone}\n"
-        f"Статус: {b_status}"
-    )
-
-    for admin_id in ADMINS:
-        try:
-            await bot.send_message(admin_id, txt_admin, reply_markup=kb_admin)
-        except Exception:
-            pass
-
-    await c.answer("Время обновлено")
-
 # -------- Admin buttons --------
-def is_admin(uid: int) -> bool:
-    return uid in ADMINS
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+def is_manager(user_id: int) -> bool:
+    return user_id in MANAGERS
+
+def is_staff(user_id: int) -> bool:
+    """Админ или менеджер (персонал)."""
+    return is_admin(user_id) or is_manager(user_id)
 
 async def get_booking(session: AsyncSession, bid: int) -> Optional[Booking]:
     return await session.get(Booking, bid)
 
 @dp.callback_query(F.data.startswith("admin:approve:"))
 async def admin_approve(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("Недостаточно прав", show_alert=True); return
+    if not is_staff(c.from_user.id):
+        await c.answer("Недостаточно прав", show_alert=True)
+        return
+
     bid = int(c.data.split(":")[-1])
 
     async with SessionLocal() as s:
         async with s.begin():
-            b = (await s.execute(
-                select(Booking).where(Booking.id == bid).with_for_update()
-            )).scalar_one_or_none()
+            b = (
+                await s.execute(
+                    select(Booking)
+                    .where(Booking.id == bid)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+
             if not b:
-                await c.answer("Бронь не найдена", show_alert=True); return
+                await c.answer("Бронь не найдена", show_alert=True)
+                return
 
             now = datetime.now(TZ)
             expired = (b.expires_at and b.expires_at < now)
 
             if expired:
+                # бронь протухла по expires_at
                 b.status = "cancelled"
 
             elif b.status == "pending":
                 # Лочим пересекающиеся, считаем занятость
                 await s.execute(
-                    text("""SELECT id FROM bookings
-                            WHERE status IN ('pending','confirmed','block')
-                              AND start_at < :end AND end_at > :start
-                            FOR UPDATE"""),
-                    {"start": b.start_at, "end": b.end_at}
+                    text(
+                        """
+                        SELECT id FROM bookings
+                        WHERE status IN ('pending','confirmed','block')
+                          AND start_at < :end AND end_at > :start
+                        FOR UPDATE
+                        """
+                    ),
+                    {"start": b.start_at, "end": b.end_at},
                 )
-                taken = (await s.execute(
-                    select(func.coalesce(func.sum(Booking.sims), 0)).where(
-                        Booking.status.in_(("pending","confirmed","block")),
-                        Booking.start_at < b.end_at,
-                        Booking.end_at > b.start_at,
-                        Booking.id != b.id
+
+                taken = (
+                    await s.execute(
+                        select(func.coalesce(func.sum(Booking.sims), 0)).where(
+                            Booking.status.in_(("pending", "confirmed", "block")),
+                            Booking.start_at < b.end_at,
+                            Booking.end_at > b.start_at,
+                            Booking.id != b.id,
+                        )
                     )
-                )).scalar_one()
+                ).scalar_one()
+
                 free = MAX_SIMS - int(taken)
 
                 if free >= b.sims:
@@ -1826,7 +2046,7 @@ async def admin_approve(c: CallbackQuery):
                     b.status = "cancelled"
 
             else:
-                # Уже не pending — оставляем как есть (idempotency)
+                # Уже не pending — оставляем как есть (idempotent)
                 pass
 
         # читаем поля ПОСЛЕ транзакции
@@ -1837,10 +2057,23 @@ async def admin_approve(c: CallbackQuery):
         client_name = b.client_name or "-"
         client_phone = b.client_phone or "-"
 
-    # Ответы и тексты
+    # ===== Ответы и тексты =====
     if status == "confirmed":
-        await safe_edit_text(c.message, f"✅ Подтверждена заявка #{bid}")
-        await safe_edit_reply_markup(c.message, reply_markup=None)
+        # Перерисовываем админскую карточку с новыми кнопками (пришёл / не пришёл)
+        kb_after = build_admin_booking_kb_confirmed(bid)
+        await safe_edit_text(
+            c.message,
+            (
+                f"✅ Подтверждена заявка #{bid}\n\n"
+                f"{human(start_at)}–{end_at.astimezone(TZ).strftime('%H:%M')} | "
+                f"{sims} {sims_word(sims)} | {dur} мин | {price} ₽\n"
+                f"Клиент: {client_name}, {client_phone}\n\n"
+                "После визита нажми: 🏁 «Пришёл» или 🚫 «Не пришёл»."
+            ),
+            reply_markup=kb_after,
+        )
+
+        # Сообщаем клиенту
         try:
             await bot.send_message(
                 user_id,
@@ -1852,33 +2085,49 @@ async def admin_approve(c: CallbackQuery):
                     f"Контакт у нас есть: {client_name}, {client_phone}\n"
                     f"📍 Адрес: {ADDRESS_FULL} ({ADDRESS_AREA})"
                 ),
-                reply_markup=confirm_user_kb(bid)   # ← вот это
+                reply_markup=confirm_user_kb(bid),
             )
         except Exception:
             pass
 
     elif status == "pending":
-        # Сюда мы уже не попадём, но оставим на будущее
-        await safe_edit_text(c.message, f"⏳ Заявка #{bid} всё ещё в ожидании")
+        # Теоретически сюда не попадём, но оставим на будущее
+        await safe_edit_text(
+            c.message,
+            f"⏳ Заявка #{bid} всё ещё в ожидании",
+        )
+
     elif status == "cancelled":
-        await safe_edit_text(c.message, f"❌ Не удалось подтвердить заявку #{bid} (слот недоступен/просрочена)")
+        # Не смогли подтвердить (нет мощностей или протухла)
+        await safe_edit_text(
+            c.message,
+            f"❌ Не удалось подтвердить заявку #{bid} (слот недоступен или заявка просрочена)",
+            reply_markup=None,
+        )
         try:
             await bot.send_message(
                 user_id,
-                (f"⚠️ Бронь #{bid} не удалось подтвердить — окно занято или заявка просрочена.\n"
-                 f"Попробуйте выбрать другое время: /start")
+                (
+                    f"⚠️ Бронь #{bid} не удалось подтвердить — окно занято или заявка просрочена.\n"
+                    f"Попробуйте выбрать другое время: /start"
+                ),
             )
         except Exception:
             pass
+
     else:
         # Уже была confirmed/cancelled/done/no_show/block — ничего не меняли
-        await safe_edit_text(c.message, f"ℹ️ Заявка #{bid} уже в статусе: {human_status(status)}")
+        await safe_edit_text(
+            c.message,
+            f"ℹ️ Заявка #{bid} уже в статусе: {human_status(status)}",
+        )
         await safe_edit_reply_markup(c.message, reply_markup=None)
+
     await c.answer()
 
 @dp.callback_query(F.data.startswith("admin:contact:"))
 async def admin_contact_info(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
+    if not is_staff(c.from_user.id):
         await c.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1905,7 +2154,7 @@ async def admin_contact_info(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin:askcontact:"))
 async def admin_ask_contact(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
+    if not is_staff(c.from_user.id):
         await c.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1945,7 +2194,7 @@ async def admin_ask_contact(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("admin:done:"))
 async def admin_mark_done(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
+    if not is_staff(c.from_user.id):
         await c.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1966,13 +2215,18 @@ async def admin_mark_done(c: CallbackQuery):
             await c.answer("Эта заявка не была подтверждена, странно закрывать её как 'пришёл'", show_alert=True)
             return
 
-        if now_local < b.start_at.astimezone(TZ) - timedelta(minutes=10):
+        # теперь требуем, чтобы слот уже закончился
+        if now_local < b.end_at.astimezone(TZ):
             await c.answer("Слишком рано отмечать визит как завершённый 🙃", show_alert=True)
             return
 
         # фиксируем финальный статус
         b.status = "done"
         b.expires_at = None
+
+        # бонусы за визит
+        await apply_bonus_for_booking(s, b)
+
         await s.commit()
 
         # пишем клиенту (если хотим — можно не писать, но это приятно)
@@ -1994,7 +2248,7 @@ async def admin_mark_done(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin:noshow:"))
 async def admin_mark_noshow(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
+    if not is_staff(c.from_user.id):
         await c.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -2032,7 +2286,7 @@ async def admin_mark_noshow(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin:reject:"))
 async def admin_reject(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
+    if not is_staff(c.from_user.id):
         await c.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -2081,23 +2335,47 @@ async def my_list_cb(c: CallbackQuery):
         )
         rows = (await s.execute(q)).scalars().all()
 
+    client = await get_client_by_tg(c.from_user.id)
+
     if not rows:
         await c.message.answer("У вас нет активных заявок.")
         await c.answer()
         return
 
-    lines = []
+    await c.message.answer("Ваши активные заявки:")
+
     for b in rows:
-        lines.append(
+        text = (
             f"#{b.id} — {human(b.start_at)}–{b.end_at.astimezone(TZ).strftime('%H:%M')}\n"
             f"{b.sims} {sims_word(b.sims)} | {b.duration} мин | {b.price} ₽\n"
             f"Статус: {human_status(b.status)}\n"
-            f"Контакт: {(b.client_name or '—')}, {(b.client_phone or '—')}\n"
-            f"/edit {b.id} изменить время • /cancel {b.id} отменить\n"
-            f"/contact {b.id} Имя, Телефон — обновить контакт\n"
+            f"Контакт: {(b.client_name or '—')}, {(b.client_phone or '—')}"
         )
 
-    await c.message.answer("Ваши активные заявки:\n\n" + "\n".join(lines))
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Изменить время", callback_data=f"edit:open:{b.id}")],
+                [InlineKeyboardButton(text="📞 Обновить контакт", callback_data=f"contact:ask:{b.id}")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel:ask:{b.id}")],
+            ]
+        )
+
+        await c.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+    # бонусы одним сообщением
+    if client and client.bonus_balance > 0:
+        bonus_text = (
+            f"\n🎁 Твой бонусный баланс: <b>{client.bonus_balance} ₽</b>\n"
+            f"Ими можно оплатить до <b>50%</b> стоимости следующего визита."
+        )
+    else:
+        bonus_text = (
+            "\n🎁 У тебя пока нет бонусов.\n"
+            "За каждую игру копится <b>5%</b> от суммы визита — "
+            "ими можно будет оплатить до <b>50%</b> следующего."
+        )
+
+    await c.message.answer(bonus_text, parse_mode="HTML")
     await c.answer()
 
 @dp.message(Command("my"))
@@ -2105,6 +2383,7 @@ async def my_cmd(m: Message):
     now_local = datetime.now(TZ)
 
     async with SessionLocal() as s:
+        # заявки
         q = (
             select(Booking)
             .where(
@@ -2116,22 +2395,46 @@ async def my_cmd(m: Message):
         )
         rows = (await s.execute(q)).scalars().all()
 
+    client = await get_client_by_tg(m.from_user.id)
+
     if not rows:
         await m.answer("У вас нет активных заявок.")
         return
 
-    lines = []
+    await m.answer("Ваши активные заявки:")
+
     for b in rows:
-        lines.append(
+        text = (
             f"#{b.id} — {human(b.start_at)}–{b.end_at.astimezone(TZ).strftime('%H:%M')}\n"
             f"{b.sims} {sims_word(b.sims)} | {b.duration} мин | {b.price} ₽\n"
             f"Статус: {human_status(b.status)}\n"
-            f"Контакт: {(b.client_name or '—')}, {(b.client_phone or '—')}\n"
-            f"/edit {b.id} изменить время • /cancel {b.id} отменить\n"
-            f"/contact {b.id} Имя, Телефон — обновить контакт\n"
+            f"Контакт: {(b.client_name or '—')}, {(b.client_phone or '—')}"
         )
 
-    await m.answer("Ваши активные заявки:\n\n" + "\n".join(lines))
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Изменить время", callback_data=f"edit:open:{b.id}")],
+                [InlineKeyboardButton(text="📞 Обновить контакт", callback_data=f"contact:ask:{b.id}")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel:ask:{b.id}")],
+            ]
+        )
+
+        await m.answer(text, reply_markup=kb, parse_mode="HTML")
+
+    # бонусы отдельным сообщением
+    if client and client.bonus_balance > 0:
+        bonus_text = (
+            f"\n\n🎁 На бонусном балансе сейчас: <b>{client.bonus_balance} ₽</b>.\n"
+            "Ими можно оплатить до <b>50%</b> стоимости следующего визита."
+        )
+    else:
+        bonus_text = (
+            "\n\n🎁 У нас есть бонусная программа: после фактического посещения "
+            "5% от суммы визита копятся на бонусный баланс. "
+            "Ими можно оплатить до <b>50%</b> следующего визита."
+        )
+
+    await m.answer(bonus_text, parse_mode="HTML")
 
 @dp.message(Command("edit"))
 async def edit_cmd(m: Message):
@@ -2150,7 +2453,10 @@ async def edit_cmd(m: Message):
             return
 
         if b.status != "pending":
-            await m.answer("Эту заявку уже нельзя изменить (она не в ожидании).")
+            await m.answer(
+                "Эту заявку уже нельзя изменить, она уже подтверждена.\n"
+                "Если нужно другое время — отмените её (/cancel ID) и создайте новую бронь."
+            )
             return
 
         if datetime.now(TZ) >= b.start_at.astimezone(TZ):
@@ -2179,6 +2485,51 @@ async def edit_cmd(m: Message):
         )
 
     await m.answer(msg_text, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("edit:open:"))
+async def edit_open_cb(c: CallbackQuery):
+    # edit:open:{bid}
+    _, _, bid_str = c.data.split(":")
+    bid = int(bid_str)
+
+    async with SessionLocal() as s:
+        b = await s.get(Booking, bid)
+
+        if not b or b.user_id != c.from_user.id:
+            await c.answer("Заявка не найдена.", show_alert=True)
+            return
+
+        if b.status != "pending":
+            await c.answer("Эту заявку уже нельзя изменить (она не в ожидании).", show_alert=True)
+            return
+
+        if datetime.now(TZ) >= b.start_at.astimezone(TZ):
+            await c.answer("Эту заявку уже нельзя изменить, время скоро начинается или уже началось.", show_alert=True)
+            return
+
+        duration = b.duration
+        sims = b.sims
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Сегодня", callback_data=f"edit:day:{bid}:0:{duration}:{sims}")],
+                [InlineKeyboardButton(text="Завтра", callback_data=f"edit:day:{bid}:1:{duration}:{sims}")],
+                [InlineKeyboardButton(text="Послезавтра", callback_data=f"edit:day:{bid}:2:{duration}:{sims}")],
+                [InlineKeyboardButton(text="📅 Другая дата", callback_data=f"editcal:open:{bid}:{duration}:{sims}")],
+            ]
+        )
+
+        msg_text = (
+            f"Редактируем заявку #{bid}.\n"
+            f"Текущая бронь: {human(b.start_at)}–{b.end_at.astimezone(TZ).strftime('%H:%M')} "
+            f"| {b.sims} {sims_word(b.sims)} | {b.duration} мин.\n"
+            f"Имя: {b.client_name or '-'}\n"
+            f"Тел: {b.client_phone or '-'}\n\n"
+            "Выбери новый день:"
+        )
+
+    await c.message.answer(msg_text, reply_markup=kb)
+    await c.answer()
 
 @dp.message(Command("book"))
 async def book_cmd(m: Message):
@@ -2240,65 +2591,97 @@ async def cancel_cmd(m: Message):
 
         b.status = "cancelled"
         b.expires_at = None
+
+        start_at = b.start_at
+        end_at = b.end_at
+        sims = b.sims
+        dur = b.duration
+        price = b.price
+
         await s.commit()
 
     await m.answer(f"❌ Заявка #{bid} отменена.")
 
+    uname = m.from_user.username or m.from_user.full_name
+    text = (
+        f"❌ Пользователь @{uname} отменил заявку #{bid}\n"
+        f"{human(start_at)}–{end_at.astimezone(TZ).strftime('%H:%M')} | "
+        f"{sims} {sims_word(sims)} | {dur} мин | {price} ₽\n"
+        f"Освободилось: {sims} {sims_word(sims)}"
+    )
+    for staff_id in STAFF_IDS:
+        try:
+            await bot.send_message(staff_id, text)
+        except Exception:
+            pass
+
 @dp.message(Command("help"))
 async def help_cmd(m: Message):
-    text = (
+    base = (
         "🧭 <b>Доступные команды</b>\n\n"
         "👤 <b>Пользователи:</b>\n"
         "• /start — главное меню\n"
         "• /book — начать бронирование\n"
-        "• /my — показать ваши активные заявки\n"
-        "  или воспользуйтесь кнопкой «📄 Мои заявки» в меню\n"
-        "• /contact — обновить контактные данные (Имя, Телефон)\n"
-        "• /help — помощь по командам\n\n"
-        "👮 <b>Администраторы:</b>\n"
-        "• /day [YYYY-MM-DD] — расписание на день\n"
-        "• /report [YYYY-MM-DD] — отчёт по дню\n"
-        "• /csv YYYY-MM|YYYY-MM-DD — выгрузка CSV\n"
-        "• /block — создать техперерыв\n"
-        "• /unblock ID — удалить техперерыв\n"
-        "• /no_show ID — отметить неявку клиента\n"
-        "• /promo — управление промокодами\n\n"
-        "💡 <b>Подсказки:</b>\n"
-        "• Нажмите «🔔 Уведомить», если нужное время занято — бот пришлёт сообщение, когда появится окно.\n"
-        "• Используйте «📄 Мои заявки» в меню, чтобы быстро просмотреть или отменить бронь.\n"
-        "• Бот автоматически подтвердит или завершит брони по времени.\n"
+        "• /my — ваши активные заявки\n"
+        "• /map — как нас найти\n"
+        "• /support — связаться с админом\n"
+        "• /bonus — бонусы (если есть)\n"
     )
-    await m.answer(text, parse_mode="HTML")
+
+    if is_admin(m.from_user.id):
+        admin_part = (
+            "\n👮 <b>Администраторы:</b>\n"
+            "• /day [YYYY-MM-DD] — расписание на день\n"
+            "• /report [YYYY-MM-DD] — отчёт по дню\n"
+            "• /csv YYYY-MM|YYYY-MM-DD — выгрузка CSV\n"
+            "• /block — создать техперерыв\n"
+            "• /unblock ID — удалить техперерыв\n"
+            "• /no_show ID — отметить неявку клиента\n"
+            "• /promo — управление промокодами\n"
+        )
+    else:
+        admin_part = ""
+
+    await m.answer(base + admin_part, parse_mode="HTML")
 
 # -------- Reminder worker --------
 async def complete_worker():
     """
-    Переводит прошедшие подтверждённые брони в статус done.
-    Логика:
-    - статус == confirmed
-    - end_at < сейчас
-    -> статус = done
+    Автоматически помечает брони как 'done' ТОЛЬКО если:
+    - статус по-прежнему 'confirmed'
+    - слот закончился БОЛЕЕ ЧЕМ 2 ЧАСА НАЗАД
+    Это даёт админу время отметить 'пришёл' / 'не пришёл' вручную.
     """
+    AUTO_DONE_DELAY = timedelta(hours=2)
+
     while True:
         try:
             now_local = datetime.now(TZ)
+            cutoff = now_local - AUTO_DONE_DELAY
 
             async with SessionLocal() as s:
                 q = (
                     select(Booking)
                     .where(
                         Booking.status == "confirmed",
-                        Booking.end_at < now_local,
+                        Booking.end_at < cutoff,
                     )
                 )
                 finished = (await s.execute(q)).scalars().all()
 
                 if finished:
-                    logger.info("complete_worker: найдено %d завершившихся confirmed-брони(й)", len(finished))
+                    logger.info(
+                        "complete_worker: авто-завершение %d брони(й), "
+                        "которые закончились более %s назад",
+                        len(finished),
+                        AUTO_DONE_DELAY,
+                    )
 
                     for b in finished:
                         b.status = "done"
-                        b.expires_at = None  # на всякий случай
+                        b.expires_at = None
+                        await apply_bonus_for_booking(s, b)
+
                     await s.commit()
         except Exception as e:
             logger.exception("complete_worker: ошибка в цикле: %s", e)
@@ -2423,9 +2806,9 @@ async def autoconfirm_worker():
                     f"Имя: {b_name}\n"
                     f"Тел: {b_phone}"
                 )
-                for admin_id in ADMINS:
+                for staff_id in STAFF_IDS:
                     try:
-                        await bot.send_message(admin_id, note_for_admins)
+                        await bot.send_message(staff_id, text)
                     except Exception as e:
                         logger.exception("autoconfirm_worker: не удалось отправить уведомление админу %d: %s", admin_id, e)
 
@@ -2494,9 +2877,9 @@ async def contact_cmd(m: Message, state: FSMContext):
             f"Имя: {client_name}\n"
             f"Тел: {client_phone}"
         )
-        for admin_id in ADMINS:
+        for staff_id in STAFF_IDS:
             try:
-                await bot.send_message(admin_id, note)
+                await bot.send_message(staff_id, text)
             except Exception:
                 pass
 
@@ -2553,14 +2936,28 @@ async def day_free_slots(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("ics:send:"))
 async def ics_send_cb(c: CallbackQuery):
     bid = int(c.data.split(":")[-1])
+
     async with SessionLocal() as s:
         b = await s.get(Booking, bid)
         if not b or b.user_id != c.from_user.id:
-            await c.answer("Заявка не найдена", show_alert=True); return
+            await c.answer("Заявка не найдена", show_alert=True)
+            return
         if b.status not in ("confirmed", "done"):
-            await c.answer("ICS доступен после подтверждения.", show_alert=True); return
-    await _send_ics(bot, c.from_user.id, b)
+            await c.answer("ICS доступен после подтверждения.", show_alert=True)
+            return
+
+    await send_ics(bot, c.from_user.id, b)
     await c.answer("Файл календаря отправлен ✅")
+
+@dp.callback_query(F.data == "promo:open")
+async def promo_open_cb(c: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoForm.waiting_code)
+    await c.message.answer(
+        "Введи промокод одним сообщением (только код, без /promo).\n"
+        "Например: <code>WELCOME10</code>",
+        parse_mode="HTML"
+    )
+    await c.answer()
 
 # -------- Operator day view --------
 @dp.message(Command("day"))
@@ -2629,99 +3026,6 @@ async def day_cmd(m: Message):
     # делаем второе сообщение без клавиатуры
     await m.answer(timetable_text)
 
-# ===== PROMOCODES (in-memory) =====
-# Примеры с лимитами и минималкой
-
-
-# user_id -> {"code": str, "rule": dict}
-PROMOS_PENDING: dict[int, dict] = {}
-
-# учёт применений
-PROMO_USAGE_TOTAL: dict[str, int] = {}                # code -> total uses
-PROMO_USAGE_PER_USER: dict[str, dict[int, int]] = {}  # code -> {user_id: n}
-
-def _promo_can_use(code: str, rule: dict, user_id: int, base_price: int) -> tuple[bool, str | None]:
-    # срок действия
-    if rule.get("until") and today_local() > rule["until"]:
-        return False, "Срок действия промокода истёк."
-    # перс-реферальный запрет для владельца (если такой ключ появится)
-    owner_id = rule.get("owner_id")
-    if owner_id is not None and owner_id == user_id:
-        return False, "Нельзя использовать свой реферальный код."
-    # минимальная сумма
-    if base_price < int(rule.get("min_total", 0)):
-        return False, f"Минимальная сумма для этого промокода: {rule['min_total']} ₽."
-    # общий лимит
-    total_used = PROMO_USAGE_TOTAL.get(code, 0)
-    total_limit = rule.get("total_limit")
-    if total_limit is not None and total_used >= total_limit:
-        return False, "Лимит промокода исчерпан."
-    # лимит на пользователя
-    per_user_limit = int(rule.get("per_user_limit", 0)) or None
-    if per_user_limit:
-        used_by_user = PROMO_USAGE_PER_USER.get(code, {}).get(user_id, 0)
-        if used_by_user >= per_user_limit:
-            return False, "Лимит использования на пользователя исчерпан."
-    return True, None
-
-def apply_promo(base_price: int, user_id: int) -> tuple[int, Optional[str]]:
-    promo = PROMOS_PENDING.get(user_id)
-    if not promo:
-        return base_price, None
-
-    code = promo["code"]
-    rule = promo["rule"]
-    ok, reason = _promo_can_use(code, rule, user_id, base_price)
-    if not ok:
-        # промо не подходит — убираем, но цену не трогаем
-        PROMOS_PENDING.pop(user_id, None)
-        return base_price, None
-
-    if rule["kind"] == "percent":
-        new_price = int(round(base_price * (100 - int(rule["value"])) / 100))
-    elif rule["kind"] == "fixed":
-        new_price = max(0, base_price - int(rule["value"]))
-    else:
-        new_price = base_price
-
-    return new_price, code
-
-def _promo_mark_used(code: str, user_id: int, rule: dict):
-    # учёт статистики
-    PROMO_USAGE_TOTAL[code] = PROMO_USAGE_TOTAL.get(code, 0) + 1
-    per_user = PROMO_USAGE_PER_USER.setdefault(code, {})
-    per_user[user_id] = per_user.get(user_id, 0) + 1
-
-    # одноразовый флаг — удаляем pending
-    if rule.get("one_time"):
-        PROMOS_PENDING.pop(user_id, None)
-
-# === ICS helpers ===
-def _ics_text_for_booking(b: Booking) -> str:
-    import uuid
-    uid = uuid.uuid4().hex
-    return (
-        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//simclub//ru//\nBEGIN:VEVENT\n"
-        f"UID:{uid}\nDTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}\n"
-        f"DTSTART:{b.start_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}\n"
-        f"DTEND:{b.end_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}\n"
-        f"SUMMARY:Симрейсинг — {b.sims} {sims_word(b.sims)}\n"
-        f"LOCATION:{ADDRESS_FULL}\n"
-        f"DESCRIPTION:{b.sims} {sims_word(b.sims)}, {b.duration} мин\nEND:VEVENT\nEND:VCALENDAR\n"
-    )
-
-async def _send_ics(bot: Bot, chat_id: int, b: Booking):
-    import tempfile, os
-    ics = _ics_text_for_booking(b)
-    fd, path = tempfile.mkstemp(prefix=f"booking_{b.id}_", suffix=".ics")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(ics)
-        await bot.send_document(chat_id, FSInputFile(path), caption=f"Календарь для брони #{b.id}")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
-
 @dp.message(Command("promo"))
 async def promo_cmd(m: Message):
     parts = m.text.strip().split(maxsplit=1)
@@ -2756,6 +3060,39 @@ async def promo_cmd(m: Message):
         lines.append(f"Осталось по коду: {max(lim_total - used, 0)} применений.")
     await m.answer("\n".join(lines))
 
+@dp.message(PromoForm.waiting_code)
+async def promo_from_button(m: Message, state: FSMContext):
+    code = m.text.strip().upper()
+    rule = PROMO_RULES.get(code)
+    if not rule:
+        await m.answer("Промокод не найден 😕")
+        await state.clear()
+        return
+
+    # запрет использования своего реф-кода
+    if rule.get("owner_id") == m.from_user.id:
+        await m.answer("Нельзя использовать свой реферальный код.")
+        await state.clear()
+        return
+
+    PROMOS_PENDING[m.from_user.id] = {"code": code, "rule": rule}
+    kind = "скидка %" if rule["kind"] == "percent" else "скидка ₽"
+    lim_user = rule.get("per_user_limit")
+    lim_total = rule.get("total_limit")
+    min_total = rule.get("min_total", 0)
+
+    lines = [f"Ок! Применю промокод <b>{code}</b> ({kind}: {rule['value']}) к следующей брони."]
+    if min_total:
+        lines.append(f"Минимальный чек: {min_total} ₽.")
+    if lim_user:
+        lines.append(f"Лимит на пользователя: {lim_user}.")
+    if lim_total:
+        used = PROMO_USAGE_TOTAL.get(code, 0)
+        lines.append(f"Осталось по коду: {max(lim_total - used, 0)} применений.")
+
+    await m.answer("\n".join(lines), parse_mode="HTML")
+    await state.clear()
+
 @dp.startup()
 async def on_startup(bot: Bot):
     # (опц.) сброс вебхука
@@ -2780,6 +3117,42 @@ async def on_startup(bot: Bot):
         asyncio.create_task(cleanup_pending_worker(), name="cleanup_pending_worker"),
     ]
 
+@dp.message(Command("help"))
+async def help_cmd(m: Message):
+    base = (
+        "🧭 <b>Доступные команды</b>\n\n"
+        "👤 <b>Пользователи:</b>\n"
+        "• /start — главное меню\n"
+        "• /book — начать бронирование\n"
+        "• /my — ваши активные заявки\n"
+        "• /map — как нас найти\n"
+        "• /support — связаться с админом\n"
+        "• /bonus — бонусы (если есть)\n"
+    )
+
+    if is_admin(m.from_user.id):
+        admin_part = (
+            "\n👮 <b>Администраторы:</b>\n"
+            "• /day [YYYY-MM-DD] — расписание на день\n"
+            "• /report [YYYY-MM-DD] — отчёт по дню\n"
+            "• /csv YYYY-MM|YYYY-MM-DD — выгрузка CSV\n"
+            "• /block — создать техперерыв\n"
+            "• /unblock ID — удалить техперерыв\n"
+            "• /no_show ID — отметить неявку клиента\n"
+            "• /promo — управление промокодами\n"
+        )
+    elif is_manager(m.from_user.id):
+        admin_part = (
+            "\n👨‍💼 <b>Персонал (менеджеры):</b>\n"
+            "Ты получаешь заявки в чат с кнопками:\n"
+            "• ✅ Подтвердить / ❌ Отклонить\n"
+            "• 🏁 Пришёл / 🚫 Не пришёл\n"
+            "Работай только через эти кнопки, чтобы не мешать клиентам 🙂\n"
+        )
+    else:
+        admin_part = ""
+
+    await m.answer(base + admin_part, parse_mode="HTML")
 
 @dp.shutdown()
 async def on_shutdown(bot: Bot):
@@ -2796,23 +3169,28 @@ async def catch_free_contact(m: Message):
     if m.from_user.id not in PENDING_CONTACTS:
         return
 
-    if not looks_like_contact(m.text):
-        # не похоже на контакт → не считаем это ответом на запрос
-        return
+    # 1) если юзер отправил Telegram-контакт — используем его
+    if m.contact:
+        client_name = m.contact.first_name
+        if m.contact.last_name:
+            client_name += f" {m.contact.last_name}"
+        client_name = client_name.strip()
+        client_phone = m.contact.phone_number
+    else:
+        # 2) если нет текста или текст не похож на контакт — игнорим
+        if not m.text or not looks_like_contact(m.text):
+            return
+        client_name, client_phone = split_contact(m.text)
 
     bid = PENDING_CONTACTS.pop(m.from_user.id)
-
-    client_name, client_phone = split_contact(m.text)
 
     async with SessionLocal() as s:
         b = await s.get(Booking, bid)
 
-        # защита от дурака: заявка пропала / не его
         if not b or b.user_id != m.from_user.id:
             await m.answer("Не получилось обновить контакт по заявке. Если что, можно написать администратору напрямую 🙌")
             return
 
-        # пишем новые данные
         b.client_name = client_name
         b.client_phone = client_phone
         await s.commit()
@@ -2824,7 +3202,6 @@ async def catch_free_contact(m: Message):
         dur = b.duration
         price = b.price
 
-    # ответ клиенту
     await m.answer(
         "Контакт обновлён ✅\n\n"
         f"Заявка #{bid}\n"
@@ -2832,10 +3209,10 @@ async def catch_free_contact(m: Message):
         f"{sims} {sims_word(sims)} | {dur} мин | {price} ₽\n"
         f"Теперь указано:\n"
         f"{client_name}, {client_phone}\n\n"
-        "Спасибо! Администратор получил новые данные 👌"
+        "Спасибо! Администратор получил новые данные 👌",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-    # пуш админам
     admin_text = (
         f"✏️ Обновлён контакт в заявке #{bid}\n"
         f"{human(start_at)}–{end_at.astimezone(TZ).strftime('%H:%M')} | "
@@ -2843,9 +3220,9 @@ async def catch_free_contact(m: Message):
         f"Новый контакт: {client_name}, {client_phone}"
     )
 
-    for admin_id in ADMINS:
+    for staff_id in STAFF_IDS:
         try:
-            await bot.send_message(admin_id, admin_text)
+            await bot.send_message(staff_id, text)
         except Exception:
             pass
 
@@ -2885,4 +3262,7 @@ async def main():
     await dp.start_polling(bot, polling_timeout=60)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user ⏹")

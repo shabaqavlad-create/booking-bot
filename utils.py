@@ -85,6 +85,3 @@ def price_for(duration: int, sims: int) -> int:
 
 def _ensure_tz(dt: datetime) -> datetime:
     return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
-
-start = _ensure_tz(start)
-end   = _ensure_tz(end)
